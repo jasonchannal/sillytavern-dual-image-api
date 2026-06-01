@@ -13,6 +13,8 @@
 - OpenAI-compatible 生图接口。
 - Generic JSON 生图接口。
 - 图片生成后保存并插入当前聊天。
+- AI 回复完成后自动整理生图提示词并生成配图。
+- 自动配图会把图片插回原 AI 回复，不额外发送一条图片消息。
 - 服务端插件健康检查和配置检查。
 
 ## 安装方式
@@ -81,6 +83,17 @@ enableServerPlugins: true
 /dualimg mode=sfw a landscape concept art
 /dualimg mode=nsfw adult character illustration
 ```
+
+### 对话自动配图
+
+插件设置里打开“AI 回复后自动配图”后，每次 AI 回复完成会自动执行：
+
+1. 读取当前 AI 回复和最近几条上下文。
+2. 使用 SillyTavern 当前聊天 API 把内容整理成适合图片模型的英文提示词。
+3. 按提示词内容自动选择 SFW 或 NSFW 图片 API。
+4. 图片生成后作为媒体附件插回原 AI 回复中。
+
+这个功能默认关闭，因为开启后每次 AI 回复都可能消耗聊天 API 和生图 API 额度。
 
 ## API 类型
 

@@ -3,10 +3,13 @@ import {
     MEDIA_DISPLAY,
     MEDIA_SOURCE,
     MEDIA_TYPE,
+    SCROLL_BEHAVIOR,
 } from '/scripts/constants.js';
 import {
+    appendMediaToMessage,
     event_types,
     eventSource,
+    generateQuietPrompt,
     getRequestHeaders,
     saveSettingsDebounced,
     systemUserName,
@@ -34,8 +37,23 @@ const moduleFolder = modulePath.split('/').filter(Boolean).pop() || 'dual-image-
 const MODULE_NAME = modulePath.includes('/third-party/') ? `third-party/${moduleFolder}` : moduleFolder;
 const SETTINGS_KEY = 'dualImageApi';
 const API_BASE = '/api/plugins/dual-image-api';
+const AUTO_SKIP_TOKEN = 'SKIP';
+
+const defaultAutoPromptTemplate = `You are converting a roleplay chat reply into one image-generation prompt.
+Return only one concise English visual prompt. Do not add explanations, markdown, JSON, quotes, or labels.
+Use the current AI reply as the main scene. Include visible characters, action, setting, mood, clothing, camera/framing, and lighting.
+Do not include dialogue, internal thoughts, UI text, or non-visual prose.
+If the reply has no drawable visual scene, return SKIP.
+
+Recent chat context:
+{{context}}
+
+Current AI reply:
+{{message}}`;
 
 let activeAbortController = null;
+let autoHooksRegistered = false;
+const pendingAutoIllustrations = new Set();
 
 const defaultProfile = {
     apiType: 'openai-compatible',
@@ -109,6 +127,17 @@ const defaultSettings = {
         sfw: { ...defaultProfile },
         nsfw: { ...defaultProfile },
     },
+    autoIllustration: {
+        enabled: false,
+        usePromptBuilder: true,
+        contextMessages: 4,
+        minCharacters: 40,
+        responseLength: 180,
+        delayMs: 800,
+        skipFirstMessage: true,
+        skipIfHasMedia: true,
+        promptTemplate: defaultAutoPromptTemplate,
+    },
 };
 
 export async function init() {
@@ -117,6 +146,7 @@ export async function init() {
     addWandButton();
     bindSettings();
     registerSlashCommand();
+    registerAutoIllustrationHooks();
     await refreshSecretStatus();
 }
 
@@ -189,6 +219,8 @@ function bindSettings() {
         saveSettingsDebounced();
     });
 
+    bindAutoSettings(current);
+
     for (const mode of ['sfw', 'nsfw']) {
         loadProfileInputs(mode);
         updateGenericVisibility(mode);
@@ -221,6 +253,62 @@ function bindSettings() {
     $('#dual_image_health').on('click', checkHealth);
     $('#dual_image_refresh_keys').on('click', refreshSecretStatus);
     $('#dual_image_cancel').on('click', cancelActiveGeneration);
+}
+
+function bindAutoSettings(current) {
+    const auto = current.autoIllustration;
+
+    $('#dual_image_auto_enabled').prop('checked', auto.enabled).on('input', () => {
+        auto.enabled = $('#dual_image_auto_enabled').prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_use_prompt_builder').prop('checked', auto.usePromptBuilder).on('input', () => {
+        auto.usePromptBuilder = $('#dual_image_auto_use_prompt_builder').prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_skip_first_message').prop('checked', auto.skipFirstMessage).on('input', () => {
+        auto.skipFirstMessage = $('#dual_image_auto_skip_first_message').prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_skip_if_has_media').prop('checked', auto.skipIfHasMedia).on('input', () => {
+        auto.skipIfHasMedia = $('#dual_image_auto_skip_if_has_media').prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_context_messages').val(auto.contextMessages).on('input', () => {
+        auto.contextMessages = Math.max(1, Number($('#dual_image_auto_context_messages').val()) || defaultSettings.autoIllustration.contextMessages);
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_min_chars').val(auto.minCharacters).on('input', () => {
+        auto.minCharacters = Math.max(0, Number($('#dual_image_auto_min_chars').val()) || defaultSettings.autoIllustration.minCharacters);
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_response_length').val(auto.responseLength).on('input', () => {
+        auto.responseLength = Math.max(64, Number($('#dual_image_auto_response_length').val()) || defaultSettings.autoIllustration.responseLength);
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_delay_ms').val(auto.delayMs).on('input', () => {
+        auto.delayMs = Math.max(0, Number($('#dual_image_auto_delay_ms').val()) || defaultSettings.autoIllustration.delayMs);
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_prompt_template').val(auto.promptTemplate).on('input', () => {
+        auto.promptTemplate = String($('#dual_image_auto_prompt_template').val() || defaultAutoPromptTemplate);
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_auto_reset_prompt').on('click', () => {
+        auto.promptTemplate = defaultAutoPromptTemplate;
+        $('#dual_image_auto_prompt_template').val(auto.promptTemplate);
+        saveSettingsDebounced();
+        toastr.success('自动配图提示词模板已恢复默认。', 'Dual Image API');
+    });
 }
 
 function loadProfileInputs(mode) {
@@ -305,39 +393,75 @@ function registerSlashCommand() {
 }
 
 async function generateImage(prompt, requestedMode = 'auto') {
-    if (!settings().enabled) {
-        toastr.warning('Dual Image API 插件未启用。');
+    const generated = await createGeneratedImage(prompt, requestedMode, {
+        showToasts: true,
+        abortActive: true,
+        statusPrefix: '正在使用',
+    });
+
+    if (!generated) {
         return;
+    }
+
+    await sendImageMessage(generated.prompt, generated.imagePath, generated.mode);
+    setStatus(`生成完成：${generated.mode.toUpperCase()}`);
+    toastr.success('图片已生成。', 'Dual Image API');
+}
+
+async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}) {
+    const showToasts = options.showToasts !== false;
+    const abortActive = options.abortActive !== false;
+    const statusPrefix = options.statusPrefix || '正在使用';
+
+    if (!settings().enabled) {
+        if (showToasts) {
+            toastr.warning('Dual Image API 插件未启用。');
+        }
+        return null;
     }
 
     if (!prompt) {
-        toastr.warning('请输入生图提示词。');
-        return;
+        if (showToasts) {
+            toastr.warning('请输入生图提示词。');
+        }
+        return null;
     }
 
     if (activeAbortController) {
+        if (!abortActive) {
+            setStatus('自动配图跳过：当前已有生图任务。');
+            return null;
+        }
         activeAbortController.abort('New generation started');
     }
 
     const decision = decideMode(prompt, requestedMode);
     if (decision.blocked) {
-        toastr.error(decision.reason, 'Dual Image API');
-        return;
+        setStatus(`生成已拦截：${decision.reason}`);
+        if (showToasts) {
+            toastr.error(decision.reason, 'Dual Image API');
+        }
+        return null;
     }
 
     if (decision.mode === 'nsfw' && !settings().allowNsfw) {
-        toastr.error('NSFW 模式未启用。请先在插件设置中打开允许 NSFW 模式。', 'Dual Image API');
-        return;
+        const message = 'NSFW 模式未启用。请先在插件设置中打开允许 NSFW 模式。';
+        setStatus(message);
+        if (showToasts) {
+            toastr.error(message, 'Dual Image API');
+        }
+        return null;
     }
 
     const profile = settings().profiles[decision.mode];
-    activeAbortController = new AbortController();
-    setStatus(`正在使用 ${decision.mode.toUpperCase()} 生成...`);
+    const abortController = new AbortController();
+    activeAbortController = abortController;
+    setStatus(`${statusPrefix} ${decision.mode.toUpperCase()} 生成...`);
 
     try {
         const result = await fetchJson('/generate', {
             method: 'POST',
-            signal: activeAbortController.signal,
+            signal: abortController.signal,
             body: {
                 prompt,
                 mode: decision.mode,
@@ -350,23 +474,244 @@ async function generateImage(prompt, requestedMode = 'auto') {
         }
 
         const imagePath = await saveGeneratedImage(result.data, result.format || 'png', prompt);
-        await sendImageMessage(prompt, imagePath, decision.mode);
-        setStatus(`生成完成：${decision.mode.toUpperCase()}`);
-        toastr.success('图片已生成。', 'Dual Image API');
+        return { prompt, imagePath, mode: decision.mode };
     } catch (error) {
-        if (activeAbortController?.signal.aborted) {
+        if (abortController.signal.aborted) {
             setStatus('生成已取消。');
-            toastr.info('生成已取消。', 'Dual Image API');
-            return;
+            if (showToasts) {
+                toastr.info('生成已取消。', 'Dual Image API');
+            }
+            return null;
         }
 
         console.error('[dual-image-api] generation failed', error);
         const message = error?.message || String(error);
         setStatus(`生成失败：${message}`);
-        toastr.error(message, 'Dual Image API');
+        if (showToasts) {
+            toastr.error(message, 'Dual Image API');
+        }
+        return null;
     } finally {
-        activeAbortController = null;
+        if (activeAbortController === abortController) {
+            activeAbortController = null;
+        }
     }
+}
+
+function registerAutoIllustrationHooks() {
+    if (autoHooksRegistered) {
+        return;
+    }
+
+    autoHooksRegistered = true;
+    const handler = (messageId, source) => scheduleAutoIllustration(messageId, source);
+
+    if (typeof eventSource.makeLast === 'function') {
+        eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, handler);
+    } else {
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handler);
+    }
+
+    eventSource.on(event_types.CHAT_CHANGED, () => pendingAutoIllustrations.clear());
+}
+
+function scheduleAutoIllustration(messageId, source) {
+    const auto = settings().autoIllustration;
+    if (!settings().enabled || !auto?.enabled) {
+        return;
+    }
+
+    const numericMessageId = Number(messageId);
+    if (!Number.isInteger(numericMessageId) || pendingAutoIllustrations.has(numericMessageId)) {
+        return;
+    }
+
+    if (source === 'extension') {
+        return;
+    }
+
+    if (auto.skipFirstMessage && source === 'first_message') {
+        return;
+    }
+
+    const context = getContext();
+    const message = context.chat?.[numericMessageId];
+    if (!shouldAutoIllustrateMessage(message, source)) {
+        return;
+    }
+
+    pendingAutoIllustrations.add(numericMessageId);
+    const expectedChatId = context.chatId;
+    const delayMs = Math.max(0, Number(auto.delayMs) || defaultSettings.autoIllustration.delayMs);
+
+    setTimeout(() => {
+        void processAutoIllustration(numericMessageId, expectedChatId, source)
+            .catch((error) => {
+                console.error('[dual-image-api] auto illustration failed', error);
+                const messageText = error?.message || String(error);
+                setStatus(`自动配图失败：${messageText}`);
+                toastr.error(messageText, 'Dual Image API');
+            })
+            .finally(() => pendingAutoIllustrations.delete(numericMessageId));
+    }, delayMs);
+}
+
+function shouldAutoIllustrateMessage(message, source) {
+    const auto = settings().autoIllustration;
+    if (!message || message.is_user || message.is_system) {
+        return false;
+    }
+
+    if (source === 'extension') {
+        return false;
+    }
+
+    const text = cleanMessageText(message.mes);
+    if (!text || text === '...' || text.length < Number(auto.minCharacters || 0)) {
+        return false;
+    }
+
+    if (message.extra?.dual_image_auto?.done) {
+        return false;
+    }
+
+    if (message.extra?.dual_image_mode || message.extra?.dual_image_manual) {
+        return false;
+    }
+
+    if (auto.skipIfHasMedia && Array.isArray(message.extra?.media) && message.extra.media.length > 0) {
+        return false;
+    }
+
+    return true;
+}
+
+async function processAutoIllustration(messageId, expectedChatId, source) {
+    const context = getContext();
+    if (expectedChatId !== context.chatId) {
+        return;
+    }
+
+    const message = context.chat?.[messageId];
+    if (!shouldAutoIllustrateMessage(message, source)) {
+        return;
+    }
+
+    setStatus('正在为 AI 回复生成配图提示词...');
+    const prompt = await buildAutoImagePrompt(messageId);
+    if (!prompt) {
+        setStatus('自动配图跳过：这条回复没有可绘制场景。');
+        return;
+    }
+
+    const generated = await createGeneratedImage(prompt, 'auto', {
+        showToasts: false,
+        abortActive: false,
+        statusPrefix: '正在自动配图，使用',
+    });
+
+    if (!generated) {
+        return;
+    }
+
+    await attachImageToMessage(messageId, generated.prompt, generated.imagePath, generated.mode);
+    setStatus(`自动配图完成：${generated.mode.toUpperCase()}`);
+    toastr.success('已为 AI 回复插入配图。', 'Dual Image API');
+}
+
+async function buildAutoImagePrompt(messageId) {
+    const auto = settings().autoIllustration;
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    const fallbackPrompt = cleanMessageText(message?.mes || '').slice(0, 1200);
+
+    if (!fallbackPrompt) {
+        return '';
+    }
+
+    if (!auto.usePromptBuilder) {
+        return fallbackPrompt;
+    }
+
+    const promptTemplate = auto.promptTemplate || defaultAutoPromptTemplate;
+    const quietPrompt = renderTextTemplate(promptTemplate, {
+        message: fallbackPrompt,
+        context: buildRecentChatContext(messageId),
+        char: context.name2 || '',
+        user: context.name1 || '',
+    });
+
+    try {
+        const reply = await generateQuietPrompt({
+            quietPrompt,
+            skipWIAN: true,
+            responseLength: Math.max(64, Number(auto.responseLength) || defaultSettings.autoIllustration.responseLength),
+            trimToSentence: false,
+        });
+        if (isSkipImagePrompt(reply)) {
+            return '';
+        }
+        const prompt = cleanImagePrompt(reply);
+        if (!prompt && String(reply || '').toUpperCase().includes(AUTO_SKIP_TOKEN)) {
+            return '';
+        }
+        return prompt || fallbackPrompt;
+    } catch (error) {
+        console.warn('[dual-image-api] prompt builder failed, falling back to message text', error);
+        return fallbackPrompt;
+    }
+}
+
+function buildRecentChatContext(messageId) {
+    const context = getContext();
+    const count = Math.max(1, Number(settings().autoIllustration.contextMessages) || defaultSettings.autoIllustration.contextMessages);
+    const start = Math.max(0, messageId - count + 1);
+    return context.chat
+        .slice(start, messageId + 1)
+        .map((message) => {
+            const name = message.name || (message.is_user ? context.name1 : context.name2) || 'Message';
+            return `${name}: ${cleanMessageText(message.mes).slice(0, 700)}`;
+        })
+        .filter((line) => line.trim().length > 2)
+        .join('\n');
+}
+
+async function attachImageToMessage(messageId, prompt, imagePath, mode) {
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    if (!message) {
+        throw new Error('找不到要插入图片的消息。');
+    }
+
+    message.extra = message.extra || {};
+    message.extra.media = Array.isArray(message.extra.media) ? message.extra.media : [];
+    message.extra.media.push({
+        url: imagePath,
+        type: MEDIA_TYPE.IMAGE,
+        title: prompt,
+        source: MEDIA_SOURCE.GENERATED,
+        dual_image_mode: mode,
+        dual_image_auto: true,
+    });
+    message.extra.media_display = MEDIA_DISPLAY.GALLERY;
+    message.extra.media_index = message.extra.media.length - 1;
+    message.extra.inline_image = true;
+    message.extra.dual_image_auto = {
+        done: true,
+        mode,
+        prompt,
+        source_hash: hashString(message.mes || ''),
+        inserted_at: new Date().toISOString(),
+    };
+
+    const messageElement = $(`#chat .mes[mesid="${messageId}"]`);
+    if (messageElement.length) {
+        appendMediaToMessage(message, messageElement, SCROLL_BEHAVIOR.ADJUST);
+    }
+
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    await context.saveChat();
+    setTimeout(() => context.scrollOnMediaLoad(), debounce_timeout.short);
 }
 
 function cancelActiveGeneration() {
@@ -431,6 +776,60 @@ function scoreTerms(text, terms) {
     }, 0);
 }
 
+function cleanMessageText(text) {
+    return String(text || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/!\[[^\]]*]\([^)]+\)/g, ' ')
+        .replace(/\[([^\]]+)]\([^)]+\)/g, '$1')
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function cleanImagePrompt(text) {
+    let prompt = String(text || '').trim();
+    prompt = prompt.replace(/^```(?:\w+)?/i, '').replace(/```$/i, '').trim();
+    prompt = prompt.replace(/^["'“”]+|["'“”]+$/g, '').trim();
+    prompt = prompt.replace(/^(image prompt|prompt|caption)\s*:\s*/i, '').trim();
+
+    if (!prompt || isSkipImagePrompt(prompt)) {
+        return '';
+    }
+
+    if (prompt.split(/\s+/).length <= 3 && prompt.toUpperCase().includes(AUTO_SKIP_TOKEN)) {
+        return '';
+    }
+
+    return prompt.slice(0, 1200);
+}
+
+function isSkipImagePrompt(text) {
+    return String(text || '')
+        .replace(/^```(?:\w+)?/i, '')
+        .replace(/```$/i, '')
+        .replace(/^["'“”]+|["'“”]+$/g, '')
+        .replace(/[.!。]+$/g, '')
+        .trim()
+        .toUpperCase() === AUTO_SKIP_TOKEN;
+}
+
+function renderTextTemplate(template, variables) {
+    return String(template || '').replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, key) => {
+        return String(variables[key] ?? '');
+    });
+}
+
+function hashString(value) {
+    let hash = 0;
+    const text = String(value || '');
+    for (let index = 0; index < text.length; index++) {
+        hash = ((hash << 5) - hash) + text.charCodeAt(index);
+        hash |= 0;
+    }
+    return String(hash);
+}
+
 function sanitizeProfile(profile) {
     return {
         ...profile,
@@ -471,6 +870,7 @@ async function sendImageMessage(prompt, imagePath, mode) {
             media_display: MEDIA_DISPLAY.GALLERY,
             media_index: 0,
             inline_image: false,
+            dual_image_manual: true,
         },
     };
 

@@ -51,6 +51,39 @@
             </div>
             <div id="dual_image_status" class="dual-image-status"></div>
 
+            <div class="dual-image-auto">
+                <h4>对话自动配图</h4>
+                <div class="dual-image-toolbar">
+                    <label for="dual_image_auto_enabled" class="checkbox_label">
+                        <input id="dual_image_auto_enabled" type="checkbox">
+                        <span>AI 回复后自动配图</span>
+                    </label>
+                    <label for="dual_image_auto_use_prompt_builder" class="checkbox_label">
+                        <input id="dual_image_auto_use_prompt_builder" type="checkbox">
+                        <span>先用聊天 API 整理生图提示词</span>
+                    </label>
+                    <label for="dual_image_auto_skip_first_message" class="checkbox_label">
+                        <input id="dual_image_auto_skip_first_message" type="checkbox">
+                        <span>跳过开场白</span>
+                    </label>
+                    <label for="dual_image_auto_skip_if_has_media" class="checkbox_label">
+                        <input id="dual_image_auto_skip_if_has_media" type="checkbox">
+                        <span>已有图片时跳过</span>
+                    </label>
+                </div>
+                <div class="dual-image-grid">
+                    <label>参考最近消息数<input id="dual_image_auto_context_messages" class="text_pole" type="number" min="1" max="20" step="1"></label>
+                    <label>最短回复字数<input id="dual_image_auto_min_chars" class="text_pole" type="number" min="0" step="1"></label>
+                    <label>提示词整理长度<input id="dual_image_auto_response_length" class="text_pole" type="number" min="64" step="16"></label>
+                    <label>延迟毫秒<input id="dual_image_auto_delay_ms" class="text_pole" type="number" min="0" step="100"></label>
+                </div>
+                <label>提示词整理模板<textarea id="dual_image_auto_prompt_template" class="text_pole" rows="9"></textarea></label>
+                <div id="dual_image_auto_reset_prompt" class="menu_button menu_button_icon">
+                    <i class="fa-solid fa-rotate-left"></i>
+                    <span>恢复默认模板</span>
+                </div>
+            </div>
+
             <div class="dual-image-profile" data-profile-panel="sfw">
                 <h4>SFW API</h4>
                 <div class="dual-image-key-row">
