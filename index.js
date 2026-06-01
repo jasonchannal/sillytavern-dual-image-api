@@ -451,6 +451,7 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
     const abortController = new AbortController();
     activeAbortController = abortController;
     setStatus(`${statusPrefix} ${decision.mode.toUpperCase()} 生成...`);
+    const imageTarget = getGeneratedImageTarget();
 
     try {
         const result = await fetchJson('/generate', {
@@ -460,14 +461,17 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                 prompt,
                 mode: decision.mode,
                 profile: sanitizeProfile(profile),
+                saveToUserImages: true,
+                saveFolder: imageTarget.folderName,
+                saveFilename: imageTarget.filename,
             },
         });
 
-        if (!result?.data) {
+        if (!result?.path && !result?.data) {
             throw new Error('服务端没有返回图片。');
         }
 
-        const imagePath = await saveGeneratedImage(result.data, result.format || 'png', prompt);
+        const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', prompt, imageTarget);
         return { prompt, imagePath, mode: decision.mode };
     } catch (error) {
         if (abortController.signal.aborted) {
@@ -986,11 +990,16 @@ function sanitizeProfile(profile) {
     };
 }
 
-async function saveGeneratedImage(base64, format, prompt) {
+function getGeneratedImageTarget() {
     const context = getContext();
     const folderName = context.name2 || 'DualImage';
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `${folderName}_${timestamp}`;
+    return { folderName, filename };
+}
+
+async function saveGeneratedImage(base64, format, prompt, target = null) {
+    const { folderName, filename } = target || getGeneratedImageTarget();
     return await saveBase64AsFile(base64, folderName, filename, format);
 }
 

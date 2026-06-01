@@ -10,6 +10,7 @@ export const info = {
 
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
 const validModes = new Set(['sfw', 'nsfw']);
+const saveableImageFormats = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
 const mimeExtensions = {
     'image/png': 'png',
     'image/jpeg': 'jpg',
@@ -20,7 +21,7 @@ const mimeExtensions = {
 
 export async function init(router) {
     router.get('/health', (_request, response) => {
-        response.send({ ok: true, plugin: info.id, version: '0.2.2' });
+        response.send({ ok: true, plugin: info.id, version: '0.2.3' });
     });
 
     router.get('/secrets/status', (request, response) => {
@@ -113,6 +114,17 @@ export async function init(router) {
                 ? await generateGenericJson(prompt, profile, apiKey)
                 : await generateOpenAiCompatible(prompt, profile, apiKey);
 
+            if (request.body?.saveToUserImages) {
+                const saved = await saveResultToUserImages(request, result, {
+                    folder: request.body?.saveFolder,
+                    filename: request.body?.saveFilename,
+                });
+
+                result.path = saved.path;
+                result.filename = saved.filename;
+                result.format = saved.format;
+            }
+
             response.send(result);
         } catch (error) {
             console.error('[dual-image-api] Generation failed:', redactSecretLikeText(error?.message || String(error)));
@@ -155,6 +167,92 @@ function writeSecrets(request, secrets) {
     const tmpPath = `${filePath}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(secrets, null, 2), 'utf8');
     fs.renameSync(tmpPath, filePath);
+}
+
+async function saveResultToUserImages(request, result, options = {}) {
+    const userImagesDirectory = request.user?.directories?.userImages;
+    const userRootDirectory = request.user?.directories?.root;
+
+    if (!userImagesDirectory || !userRootDirectory) {
+        throw new Error('SillyTavern user image directory is unavailable.');
+    }
+
+    const data = String(result?.data || '').trim();
+    if (!data) {
+        throw new Error('Generated image data is empty.');
+    }
+
+    const format = normalizeImageFormat(result?.format);
+    const folder = sanitizePathSegment(options.folder) || 'DualImage';
+    const filenameBase = sanitizePathSegment(removeFileExtensionFromName(String(options.filename || ''))) || `dual-image-${Date.now()}`;
+    const filename = `${filenameBase}.${format}`;
+    const targetDirectory = path.join(userImagesDirectory, folder);
+    let targetPath = path.join(targetDirectory, filename);
+
+    if (!isPathUnderDirectory(userImagesDirectory, targetPath)) {
+        throw new Error('Invalid image save path.');
+    }
+
+    await fs.promises.mkdir(targetDirectory, { recursive: true });
+    targetPath = await getUniqueFilePath(targetPath);
+
+    const imageBuffer = Buffer.from(data, 'base64');
+    if (!imageBuffer.length) {
+        throw new Error('Generated image data is invalid.');
+    }
+
+    await fs.promises.writeFile(targetPath, new Uint8Array(imageBuffer));
+
+    return {
+        path: clientRelativePath(userRootDirectory, targetPath),
+        filename: path.basename(targetPath),
+        format,
+    };
+}
+
+function normalizeImageFormat(format) {
+    const normalized = String(format || 'png').toLowerCase().replace(/^\./, '');
+    const safeFormat = normalized === 'jpeg' ? 'jpg' : normalized;
+    return saveableImageFormats.has(safeFormat) ? safeFormat : 'png';
+}
+
+function sanitizePathSegment(value) {
+    return String(value || '')
+        .trim()
+        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+        .replace(/^\.+/, '')
+        .replace(/\.+$/, '')
+        .slice(0, 120);
+}
+
+function removeFileExtensionFromName(value) {
+    return String(value || '').replace(/\.[a-z0-9]{1,8}$/i, '');
+}
+
+function clientRelativePath(rootDirectory, targetPath) {
+    return path.relative(rootDirectory, targetPath).replace(/\\/g, '/');
+}
+
+function isPathUnderDirectory(parentDirectory, targetPath) {
+    const relative = path.relative(parentDirectory, targetPath);
+    return Boolean(relative) && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+async function getUniqueFilePath(filePath) {
+    if (!fs.existsSync(filePath)) {
+        return filePath;
+    }
+
+    const extension = path.extname(filePath);
+    const base = filePath.slice(0, -extension.length);
+    for (let index = 1; index < 1000; index++) {
+        const candidate = `${base}-${index}${extension}`;
+        if (!fs.existsSync(candidate)) {
+            return candidate;
+        }
+    }
+
+    return `${base}-${Date.now()}${extension}`;
 }
 
 function validateProfile(profile) {
