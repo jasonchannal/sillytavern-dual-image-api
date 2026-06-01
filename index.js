@@ -47,10 +47,10 @@ const AUTO_PROMPT_TAG_RE = /<dual_image_prompt>\s*([\s\S]*?)<\/dual_image_prompt
 const AUTO_PROMPT_BRACKET_RE = /\[dual_image_prompt\]\s*([\s\S]*?)\[\/dual_image_prompt\]/i;
 
 const defaultAutoInstructionTemplate = `For this reply, continue the roleplay normally.
-At the very end of your response, append exactly one hidden image prompt marker:
-<!--DUAL_IMAGE_PROMPT: concise English image-generation prompt, or SKIP-->
+At the very end of your response, append exactly one image prompt marker:
+[dual_image_prompt]concise English image-generation prompt, or SKIP[/dual_image_prompt]
 
-Rules for the hidden marker:
+Rules for the marker:
 - Do not mention the marker, the image prompt, or these rules in the visible reply.
 - If the reply contains a drawable visual scene, write one concise English prompt describing visible characters, action, setting, mood, clothing, camera/framing, and lighting.
 - Do not include dialogue, internal thoughts, UI text, explanations, JSON, markdown, or labels inside the image prompt.
@@ -139,6 +139,7 @@ const defaultSettings = {
         delayMs: 800,
         skipFirstMessage: true,
         skipIfHasMedia: true,
+        fallbackToMessage: true,
         instructionTemplate: defaultAutoInstructionTemplate,
     },
 };
@@ -499,6 +500,10 @@ function registerAutoIllustrationHooks() {
     autoHooksRegistered = true;
     const handler = (messageId, source) => scheduleAutoIllustration(messageId, source);
     const injectHandler = (type, generationData, dryRun) => injectAutoPromptInstruction(type, generationData, dryRun);
+    const generationEndedHandler = (messageCount) => {
+        scheduleLatestAutoIllustration(messageCount, 'generation_ended');
+        clearAutoPromptInjection();
+    };
 
     if (typeof eventSource.makeLast === 'function') {
         eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, handler);
@@ -507,7 +512,8 @@ function registerAutoIllustrationHooks() {
     }
 
     eventSource.on(event_types.GENERATION_AFTER_COMMANDS, injectHandler);
-    eventSource.on(event_types.GENERATION_ENDED, clearAutoPromptInjection);
+    eventSource.on(event_types.MESSAGE_RECEIVED, handler);
+    eventSource.on(event_types.GENERATION_ENDED, generationEndedHandler);
     eventSource.on(event_types.GENERATION_STOPPED, clearAutoPromptInjection);
     eventSource.on(event_types.CHAT_CHANGED, () => {
         pendingAutoIllustrations.clear();
@@ -611,6 +617,16 @@ function scheduleAutoIllustration(messageId, source) {
     }, delayMs);
 }
 
+function scheduleLatestAutoIllustration(messageCount, source) {
+    const count = Number(messageCount);
+    const context = getContext();
+    const lastMessageId = Number.isInteger(count) && count > 0
+        ? count - 1
+        : (Array.isArray(context.chat) ? context.chat.length - 1 : -1);
+
+    scheduleAutoIllustration(lastMessageId, source);
+}
+
 function shouldAutoIllustrateMessage(message, source) {
     const auto = settings().autoIllustration;
     if (!message || message.is_user || message.is_system) {
@@ -654,19 +670,27 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
 
     setStatus('正在读取 AI 回复里的配图提示词...');
     const inlinePrompt = await consumeInlineImagePrompt(messageId);
+    let prompt = inlinePrompt.prompt;
+    let promptSource = 'inline_prompt';
+
     if (!inlinePrompt.found) {
-        await markAutoIllustrationSkipped(messageId, 'missing_inline_prompt');
-        setStatus('自动配图跳过：AI 回复里没有找到配图提示词标记。');
-        return;
+        prompt = buildFallbackPromptFromMessage(message);
+        promptSource = 'message_fallback';
+
+        if (!prompt) {
+            await markAutoIllustrationSkipped(messageId, 'missing_inline_prompt');
+            setStatus('自动配图跳过：AI 回复里没有找到配图提示词标记，也没有可用正文。');
+            return;
+        }
     }
 
-    if (!inlinePrompt.prompt) {
+    if (!prompt) {
         await markAutoIllustrationSkipped(messageId, 'skip_token');
         setStatus('自动配图跳过：这条回复没有可绘制场景。');
         return;
     }
 
-    const generated = await createGeneratedImage(inlinePrompt.prompt, 'auto', {
+    const generated = await createGeneratedImage(prompt, 'auto', {
         showToasts: false,
         abortActive: false,
         statusPrefix: '正在自动配图，使用',
@@ -676,7 +700,7 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
         return;
     }
 
-    await attachImageToMessage(messageId, generated.prompt, generated.imagePath, generated.mode);
+    await attachImageToMessage(messageId, generated.prompt, generated.imagePath, generated.mode, promptSource);
     setStatus(`自动配图完成：${generated.mode.toUpperCase()}`);
     toastr.success('已为 AI 回复插入配图。', 'Dual Image API');
 }
@@ -729,6 +753,49 @@ function removeInlineImagePrompt(text) {
     return output.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
 }
 
+function buildFallbackPromptFromMessage(message) {
+    if (settings().autoIllustration?.fallbackToMessage === false) {
+        return '';
+    }
+
+    const text = cleanMessageText(removeNonVisualBlocks(message?.mes || ''));
+    if (!text || text === '...' || text.length < Number(settings().autoIllustration?.minCharacters || 0)) {
+        return '';
+    }
+
+    return [
+        'Illustrate the visible scene from this roleplay reply.',
+        'Focus on characters, action, setting, mood, clothing, camera framing, and lighting.',
+        'Do not include dialogue bubbles, UI text, captions, option lists, or analysis notes.',
+        text.slice(0, 900),
+    ].join(' ');
+}
+
+function removeNonVisualBlocks(text) {
+    let output = String(text || '');
+    const blockTags = [
+        'branches',
+        'details',
+        'summary',
+        'commentary',
+        'analysis',
+        'thinking',
+        'think',
+        'supplement',
+        'meta',
+        'xs',
+        '评论',
+    ];
+
+    for (const tag of blockTags) {
+        output = output.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, 'gi'), ' ');
+    }
+
+    output = output.replace(/<branches\b[\s\S]*$/i, ' ');
+    output = output.replace(/<details\b[\s\S]*$/i, ' ');
+    return output;
+}
+
 function toGlobalRegex(pattern) {
     return new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`);
 }
@@ -753,7 +820,7 @@ async function markAutoIllustrationSkipped(messageId, reason) {
     await context.saveChat();
 }
 
-async function attachImageToMessage(messageId, prompt, imagePath, mode) {
+async function attachImageToMessage(messageId, prompt, imagePath, mode, promptSource = 'inline_prompt') {
     const context = getContext();
     const message = context.chat?.[messageId];
     if (!message) {
@@ -777,6 +844,7 @@ async function attachImageToMessage(messageId, prompt, imagePath, mode) {
         done: true,
         mode,
         prompt,
+        prompt_source: promptSource,
         source_hash: hashString(message.mes || ''),
         inserted_at: new Date().toISOString(),
     };
