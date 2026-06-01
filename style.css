@@ -81,3 +81,36 @@
 #dual_image_wand_button .extensionsMenuExtensionButton {
     width: 1.25em;
 }
+
+.dual-image-retry-panel {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 6px;
+    background: var(--SmartThemeBlurTintColor);
+}
+
+.dual-image-retry-text {
+    flex: 1 1 180px;
+    min-width: 0;
+    color: var(--SmartThemeBodyColor);
+    font-size: 0.9em;
+    overflow-wrap: anywhere;
+}
+
+.dual_image_retry_button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 28px;
+    white-space: nowrap;
+}
+
+.dual_image_retry_button.is-loading {
+    opacity: 0.7;
+    pointer-events: none;
+}

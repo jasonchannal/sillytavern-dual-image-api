@@ -22,7 +22,7 @@ const mimeExtensions = {
 
 export async function init(router) {
     router.get('/health', (_request, response) => {
-        response.send({ ok: true, plugin: info.id, version: '0.2.6' });
+        response.send({ ok: true, plugin: info.id, version: '0.2.7' });
     });
 
     router.get('/secrets/status', (request, response) => {

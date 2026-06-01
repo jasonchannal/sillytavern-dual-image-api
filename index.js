@@ -46,6 +46,7 @@ const AUTO_PROMPT_COMMENT_RE = /<!--\s*DUAL_IMAGE_PROMPT\s*:\s*([\s\S]*?)-->/i;
 const AUTO_PROMPT_TAG_RE = /<dual_image_prompt>\s*([\s\S]*?)<\/dual_image_prompt>/i;
 const AUTO_PROMPT_BRACKET_RE = /\[dual_image_prompt\]\s*([\s\S]*?)\[\/dual_image_prompt\]/i;
 const AUTO_PLACEHOLDER_RE = /<!--\s*DUAL_IMAGE_PLACEHOLDER(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_PLACEHOLDER\s*-->/i;
+const AUTO_FAILURE_RE = /<!--\s*DUAL_IMAGE_FAILURE(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_FAILURE\s*-->/i;
 
 const defaultAutoInstructionTemplate = `For this reply, continue the roleplay normally.
 If the reply contains a drawable visual scene, append exactly this placeholder and image prompt marker at the very end:
@@ -560,7 +561,11 @@ function registerAutoIllustrationHooks() {
     }
 
     autoHooksRegistered = true;
-    const handler = (messageId, source) => scheduleAutoIllustration(messageId, source);
+    const handler = (messageId, source) => {
+        scheduleAutoIllustration(messageId, source);
+        renderAutoImageControls(messageId);
+    };
+    const updateHandler = (messageId) => renderAutoImageControls(messageId);
     const injectHandler = (type, generationData, dryRun) => injectAutoPromptInstruction(type, generationData, dryRun);
     const generationEndedHandler = (messageCount) => {
         scheduleLatestAutoIllustration(messageCount, 'generation_ended');
@@ -575,12 +580,81 @@ function registerAutoIllustrationHooks() {
 
     eventSource.on(event_types.GENERATION_AFTER_COMMANDS, injectHandler);
     eventSource.on(event_types.MESSAGE_RECEIVED, handler);
+    eventSource.on(event_types.MESSAGE_UPDATED, updateHandler);
     eventSource.on(event_types.GENERATION_ENDED, generationEndedHandler);
     eventSource.on(event_types.GENERATION_STOPPED, clearAutoPromptInjection);
     eventSource.on(event_types.CHAT_CHANGED, () => {
         pendingAutoIllustrations.clear();
         clearAutoPromptInjection();
+        setTimeout(renderAutoImageControlsForChat, 50);
     });
+
+    $(document).off('click.dualImageRetry').on('click.dualImageRetry', '.dual_image_retry_button', async function () {
+        const button = $(this);
+        const messageId = Number($(this).closest('.mes').attr('mesid'));
+        button.prop('disabled', true).addClass('is-loading');
+        try {
+            await retryAutoImageForMessage(messageId);
+        } finally {
+            button.prop('disabled', false).removeClass('is-loading');
+        }
+    });
+
+    setTimeout(renderAutoImageControlsForChat, 50);
+}
+
+function renderAutoImageControls(messageId) {
+    const numericMessageId = Number(messageId);
+    if (!Number.isInteger(numericMessageId) || numericMessageId < 0) {
+        return;
+    }
+
+    const context = getContext();
+    const message = context.chat?.[numericMessageId];
+    const messageElement = $(`#chat .mes[mesid="${numericMessageId}"]`);
+    if (!messageElement.length) {
+        return;
+    }
+
+    messageElement.find('.dual-image-retry-panel').remove();
+
+    const metadata = message?.extra?.dual_image_auto;
+    const prompt = cleanImagePrompt(metadata?.prompt || '');
+    if (!metadata?.failed || metadata?.pending || pendingAutoIllustrations.has(numericMessageId) || !prompt) {
+        return;
+    }
+
+    const panel = $('<div class="dual-image-retry-panel"></div>');
+    const errorText = truncateDisplayText(metadata.error || '配图生成失败', 80);
+    const hint = $('<span class="dual-image-retry-text"></span>').text(errorText ? `配图失败：${errorText}` : '配图生成失败');
+    const button = $('<button type="button" class="menu_button dual_image_retry_button" title="使用同一提示词重新生图"></button>');
+    button.append('<i class="fa-solid fa-rotate-right" aria-hidden="true"></i>');
+    button.append(document.createTextNode('重新生图'));
+
+    panel.append(hint, button);
+
+    const textElement = messageElement.find('.mes_text').last();
+    if (textElement.length) {
+        panel.insertAfter(textElement);
+        return;
+    }
+
+    const blockElement = messageElement.find('.mes_block').first();
+    if (blockElement.length) {
+        blockElement.append(panel);
+        return;
+    }
+
+    messageElement.append(panel);
+}
+
+function renderAutoImageControlsForChat() {
+    const context = getContext();
+    if (!Array.isArray(context.chat)) {
+        return;
+    }
+
+    context.chat.forEach((_message, index) => renderAutoImageControls(index));
 }
 
 function injectAutoPromptInstruction(type, generationData = {}, dryRun = false) {
@@ -691,7 +765,10 @@ function scheduleAutoIllustration(messageId, source) {
                 setStatus(`自动配图失败：${messageText}`);
                 toastr.error(messageText, 'Dual Image API');
             })
-            .finally(() => pendingAutoIllustrations.delete(numericMessageId));
+            .finally(() => {
+                pendingAutoIllustrations.delete(numericMessageId);
+                renderAutoImageControls(numericMessageId);
+            });
     }, delayMs);
 }
 
@@ -796,6 +873,7 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
 
         await replaceAutoImagePlaceholder(messageId, placeholderId, formatImageMarkdown(generated.imagePath), {
             done: true,
+            failed: false,
             mode: generated.mode,
             prompt: generated.prompt,
             prompt_source: promptSource,
@@ -807,7 +885,7 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
         toastr.success('已为 AI 回复插入配图。', 'Dual Image API');
     } catch (error) {
         const retryCount = getRetryCount();
-        await replaceAutoImagePlaceholder(messageId, placeholderId, formatAutoImageFailure(error, retryCount), {
+        await replaceAutoImagePlaceholder(messageId, placeholderId, formatAutoImageFailure(error, retryCount, placeholderId), {
             done: true,
             failed: true,
             prompt,
@@ -817,6 +895,81 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
             inserted_at: new Date().toISOString(),
         });
         throw error;
+    }
+}
+
+async function retryAutoImageForMessage(messageId) {
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    if (!message) {
+        toastr.error('找不到要重新生图的消息。', 'Dual Image API');
+        return;
+    }
+
+    if (pendingAutoIllustrations.has(messageId)) {
+        toastr.info('这条消息正在生图中。', 'Dual Image API');
+        return;
+    }
+
+    const metadata = message.extra?.dual_image_auto || {};
+    const prompt = cleanImagePrompt(metadata.prompt) || buildFallbackPromptFromMessage(message);
+    if (!prompt) {
+        toastr.error('这条消息没有可复用的生图提示词。', 'Dual Image API');
+        return;
+    }
+
+    pendingAutoIllustrations.add(messageId);
+    const placeholderId = createPlaceholderId(messageId);
+    const promptSource = metadata.prompt_source || 'manual_retry';
+    const baseText = removePriorAutoImageResult(message.mes, metadata);
+
+    try {
+        await ensureAutoImagePlaceholder(messageId, placeholderId, baseText, prompt, promptSource);
+
+        const generated = await createGeneratedImage(prompt, 'auto', {
+            showToasts: true,
+            abortActive: false,
+            statusPrefix: '正在重新配图，使用',
+            throwOnError: true,
+            onRetry: async ({ attempt, retryCount, error }) => {
+                const messageText = `重新配图失败，正在重试 ${attempt}/${retryCount}...`;
+                await updateAutoImagePlaceholderText(messageId, placeholderId, messageText, error);
+            },
+        });
+
+        if (!generated) {
+            throw new Error('重新生成未完成。');
+        }
+
+        await replaceAutoImagePlaceholder(messageId, placeholderId, formatImageMarkdown(generated.imagePath), {
+            done: true,
+            failed: false,
+            mode: generated.mode,
+            prompt: generated.prompt,
+            prompt_source: promptSource,
+            image_path: generated.imagePath,
+            attempts: generated.attempts || 1,
+            retried_at: new Date().toISOString(),
+        });
+        setStatus(`重新配图完成：${generated.mode.toUpperCase()}`);
+        toastr.success('已重新生成配图。', 'Dual Image API');
+    } catch (error) {
+        const retryCount = getRetryCount();
+        await replaceAutoImagePlaceholder(messageId, placeholderId, formatAutoImageFailure(error, retryCount, placeholderId), {
+            done: true,
+            failed: true,
+            prompt,
+            prompt_source: promptSource,
+            retry_count: retryCount,
+            error: error?.message || String(error),
+            retried_at: new Date().toISOString(),
+        });
+        const messageText = error?.message || String(error);
+        setStatus(`重新配图失败：${messageText}`);
+        toastr.error(messageText, 'Dual Image API');
+    } finally {
+        pendingAutoIllustrations.delete(messageId);
+        renderAutoImageControls(messageId);
     }
 }
 
@@ -922,13 +1075,22 @@ function getAutoImagePlaceholderRegex(placeholderId) {
     return new RegExp(`<!--\\s*DUAL_IMAGE_PLACEHOLDER:\\s*${escapeRegExp(placeholderId)}\\s*-->\\s*[\\s\\S]*?\\s*<!--\\s*\\/DUAL_IMAGE_PLACEHOLDER\\s*-->`, 'i');
 }
 
+function getAutoImageFailureRegex(placeholderId) {
+    return new RegExp(`<!--\\s*DUAL_IMAGE_FAILURE:\\s*${escapeRegExp(placeholderId)}\\s*-->\\s*[\\s\\S]*?\\s*<!--\\s*\\/DUAL_IMAGE_FAILURE\\s*-->`, 'i');
+}
+
 function formatImageMarkdown(imagePath) {
     return `![AI 配图](${encodeMarkdownUrl(imagePath)})`;
 }
 
-function formatAutoImageFailure(error, retryCount) {
-    const message = error?.message || String(error || '未知错误');
-    return `（配图生成失败，已重试 ${retryCount} 次：${message}）`;
+function formatAutoImageFailure(error, retryCount, placeholderId = '') {
+    const message = sanitizeInlineText(error?.message || String(error || '未知错误'));
+    const body = `（配图生成失败，已重试 ${retryCount} 次：${message}）`;
+    if (!placeholderId) {
+        return body;
+    }
+
+    return `<!--DUAL_IMAGE_FAILURE:${placeholderId}-->${body}<!--/DUAL_IMAGE_FAILURE-->`;
 }
 
 function encodeMarkdownUrl(url) {
@@ -985,6 +1147,31 @@ function removeInlineImagePrompt(text) {
 
 function removeAutoImagePlaceholders(text) {
     return String(text || '').replace(toGlobalRegex(AUTO_PLACEHOLDER_RE), '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+function removePriorAutoImageResult(text, metadata = {}) {
+    let output = String(text || '');
+    const placeholderId = String(metadata.placeholder_id || '');
+
+    if (placeholderId) {
+        output = output
+            .replace(getAutoImagePlaceholderRegex(placeholderId), '')
+            .replace(getAutoImageFailureRegex(placeholderId), '');
+    }
+
+    output = output
+        .replace(toGlobalRegex(AUTO_PLACEHOLDER_RE), '')
+        .replace(toGlobalRegex(AUTO_FAILURE_RE), '');
+
+    if (metadata.image_path) {
+        output = removeMarkdownImageByPath(output, metadata.image_path);
+    }
+
+    return output
+        .replace(/\n?\s*（配图生成失败，已重试\s*\d+\s*次：[^\n]*）/g, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trimEnd();
 }
 
 function buildFallbackPromptFromMessage(message) {
@@ -1268,6 +1455,33 @@ function getRetryCount(value = settings().retryCount) {
 
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
+}
+
+function sanitizeInlineText(value) {
+    return String(value || '')
+        .replace(/<!--[\s\S]*?-->/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function truncateDisplayText(value, maxLength) {
+    const text = sanitizeInlineText(value);
+    if (!text || text.length <= maxLength) {
+        return text;
+    }
+
+    return `${text.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function removeMarkdownImageByPath(text, imagePath) {
+    const variants = [...new Set([String(imagePath || ''), encodeMarkdownUrl(imagePath)])]
+        .filter(Boolean)
+        .map(escapeRegExp);
+    if (!variants.length) {
+        return text;
+    }
+
+    return String(text || '').replace(new RegExp(`!\\[[^\\]]*\\]\\((?:${variants.join('|')})\\)`, 'g'), '');
 }
 
 function delay(ms) {
