@@ -50,15 +50,17 @@ const AUTO_PLACEHOLDER_RE = /<!--\s*DUAL_IMAGE_PLACEHOLDER(?::\s*([a-zA-Z0-9_-]+
 const defaultAutoInstructionTemplate = `For this reply, continue the roleplay normally.
 If the reply contains a drawable visual scene, append exactly this placeholder and image prompt marker at the very end:
 <!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->
-[dual_image_prompt]concise English image-generation prompt[/dual_image_prompt]
+[dual_image_prompt]35-80 word English image prompt focused only on the visible scene[/dual_image_prompt]
 
 If there is no useful visual scene, append only:
 [dual_image_prompt]SKIP[/dual_image_prompt]
 
 Rules for the marker:
 - Do not mention the marker, placeholder, image prompt, or these rules in the visible reply.
-- If the reply contains a drawable visual scene, write one concise English prompt describing visible characters, action, setting, mood, clothing, camera/framing, and lighting.
-- Do not include dialogue, internal thoughts, UI text, explanations, JSON, markdown, or labels inside the image prompt.
+- Write a compact image-generation prompt, not a plot summary.
+- Include only visible subjects, action, setting, mood, clothing, camera/framing, and lighting.
+- Include {{char}} or another visible scene partner when {{user}} appears; do not make a solo image of {{user}}.
+- Do not include dialogue, internal thoughts, lore, rules, UI text, explanations, JSON, markdown, or labels inside the image prompt.
 - If there is no useful visual scene, use SKIP.
 - Keep the placeholder and marker as the final text after the visible reply.`;
 
@@ -101,6 +103,8 @@ const defaultSettings = {
     showModeNote: true,
     defaultMode: 'auto',
     retryCount: 2,
+    jpegQuality: 82,
+    maxImageSide: 1024,
     classifier: {
         nsfwThreshold: 3,
         nsfwKeywords: [
@@ -232,6 +236,18 @@ function bindSettings() {
     $('#dual_image_retry_count').val(current.retryCount).on('input', () => {
         const value = Number($('#dual_image_retry_count').val());
         current.retryCount = Number.isFinite(value) ? clamp(Math.floor(value), 0, 10) : defaultSettings.retryCount;
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_jpeg_quality').val(current.jpegQuality).on('input', () => {
+        const value = Number($('#dual_image_jpeg_quality').val());
+        current.jpegQuality = Number.isFinite(value) ? clamp(Math.floor(value), 1, 95) : defaultSettings.jpegQuality;
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_max_image_side').val(current.maxImageSide).on('input', () => {
+        const value = Number($('#dual_image_max_image_side').val());
+        current.maxImageSide = Number.isFinite(value) ? clamp(Math.floor(value), 0, 4096) : defaultSettings.maxImageSide;
         saveSettingsDebounced();
     });
 
@@ -460,9 +476,11 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
     }
 
     const profile = settings().profiles[decision.mode];
+    const imagePrompt = prepareImagePromptForMode(prompt, decision.mode);
     const abortController = new AbortController();
     activeAbortController = abortController;
     const imageTarget = getGeneratedImageTarget();
+    const imageOutput = getImageOutputOptions();
     const retryCount = getRetryCount(options.retryCount);
     const maxAttempts = retryCount + 1;
 
@@ -475,12 +493,13 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                     method: 'POST',
                     signal: abortController.signal,
                     body: {
-                        prompt,
+                        prompt: imagePrompt,
                         mode: decision.mode,
                         profile: sanitizeProfile(profile),
                         saveToUserImages: true,
                         saveFolder: imageTarget.folderName,
                         saveFilename: imageTarget.filename,
+                        imageOutput,
                     },
                 });
 
@@ -489,7 +508,7 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                 }
 
                 const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', prompt, imageTarget);
-                return { prompt, imagePath, mode: decision.mode, attempts: attempt };
+                return { prompt: imagePrompt, imagePath, mode: decision.mode, attempts: attempt };
             } catch (error) {
                 if (abortController.signal.aborted || attempt >= maxAttempts) {
                     throw error;
@@ -611,7 +630,10 @@ function getAutoInstructionTemplate() {
 
 Additional required placeholder rule:
 - If you output a non-SKIP [dual_image_prompt], put this exact placeholder immediately before it:
-<!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->`;
+<!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->
+- The image prompt must be 35-80 English words and describe only the visible scene: subjects, action, setting, mood, clothing, lighting, and camera.
+- Include {{char}} or another visible scene partner when {{user}} appears; do not make a solo image of {{user}}.
+- Do not include dialogue, internal thoughts, lore, rules, UI text, explanations, JSON, markdown, or labels inside the image prompt.`;
 }
 
 function clearAutoPromptInjection() {
@@ -964,16 +986,20 @@ function buildFallbackPromptFromMessage(message) {
         return '';
     }
 
-    const text = cleanMessageText(removeNonVisualBlocks(message?.mes || ''));
+    const text = cleanImageSceneText(message?.mes || '');
     if (!text || text === '...' || text.length < Number(settings().autoIllustration?.minCharacters || 0)) {
         return '';
     }
 
+    const context = getContext();
+    const userName = context.name1 || '<user>';
+    const characterName = context.name2 || 'the main character';
     return [
-        'Illustrate the visible scene from this roleplay reply.',
-        'Focus on characters, action, setting, mood, clothing, camera framing, and lighting.',
-        'Do not include dialogue bubbles, UI text, captions, option lists, or analysis notes.',
-        text.slice(0, 900),
+        'Image prompt for the visible scene only.',
+        text.slice(0, 650),
+        `Include ${characterName} or another visible scene partner when ${userName} appears; avoid a solo ${userName} portrait.`,
+        'Focus on visible subjects, action, setting, mood, clothing, lighting, and camera framing.',
+        'No dialogue bubbles, captions, UI text, option lists, lore notes, or analysis.',
     ].join(' ');
 }
 
@@ -1073,6 +1099,63 @@ function cancelActiveGeneration() {
 
     activeAbortController.abort('Cancelled by user');
     setStatus('正在取消当前生成...');
+}
+
+function prepareImagePromptForMode(prompt, mode) {
+    if (mode === 'nsfw') {
+        return String(prompt || '').trim();
+    }
+
+    const scenePrompt = softenSfwPromptTerms(cleanImageSceneText(prompt)).slice(0, 1000);
+    const context = getContext();
+    const userName = context.name1 || '<user>';
+    const characterName = context.name2 || 'the main character';
+    const partnerRule = scenePrompt.includes(userName) || scenePrompt.includes('<user>')
+        ? `If ${userName} is visible, include ${characterName} or another visible scene partner in the same frame; do not make a solo ${userName} portrait.`
+        : `Avoid a solo portrait of ${userName}; show ${characterName} or another visible scene partner when the scene involves the user.`;
+
+    return [
+        'SFW image-generation prompt.',
+        scenePrompt,
+        'Keep it non-explicit, fully clothed, safe for general review, with no nudity, sexual content, fetish framing, or exposed intimate body parts.',
+        partnerRule,
+        'Focus only on visible subjects, action, setting, mood, clothing, lighting, and camera framing.',
+        'No dialogue, captions, UI, watermarks, text, lore notes, rule text, or analysis.',
+    ].filter(Boolean).join(' ');
+}
+
+function cleanImageSceneText(value) {
+    return cleanMessageText(removeAutoImagePlaceholders(removeInlineImagePrompt(removeNonVisualBlocks(value || ''))))
+        .replace(/\b(SKIP|image prompt|prompt|caption)\s*:\s*/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function softenSfwPromptTerms(value) {
+    return String(value || '')
+        .replace(/\b(nude|naked|topless|bottomless|explicit|pornographic|porn|erotic|sexual|sex)\b/gi, 'non-explicit')
+        .replace(/\b(lingerie|underwear|panties|bra)\b/gi, 'modest outfit')
+        .replace(/\b(seductive|aroused|orgasm|genitals|breasts?|nipples?)\b/gi, 'dramatic')
+        .replace(/裸露|裸体|色情|情色|性爱|性交|性器|乳头|胸部特写|内衣|私密/gi, '安全得体')
+        .trim();
+}
+
+function getImageOutputOptions() {
+    return {
+        forceJpeg: true,
+        jpegQuality: getJpegQuality(),
+        maxSide: getMaxImageSide(),
+    };
+}
+
+function getJpegQuality() {
+    const quality = Number(settings().jpegQuality);
+    return Number.isFinite(quality) ? clamp(Math.floor(quality), 1, 95) : defaultSettings.jpegQuality;
+}
+
+function getMaxImageSide() {
+    const maxSide = Number(settings().maxImageSide);
+    return Number.isFinite(maxSide) ? clamp(Math.floor(maxSide), 0, 4096) : defaultSettings.maxImageSide;
 }
 
 function decideMode(prompt, requestedMode) {

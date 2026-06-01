@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const info = {
     id: 'dual-image-api',
@@ -11,6 +11,7 @@ export const info = {
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
 const validModes = new Set(['sfw', 'nsfw']);
 const saveableImageFormats = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
+let jimpToolsPromise = null;
 const mimeExtensions = {
     'image/png': 'png',
     'image/jpeg': 'jpg',
@@ -21,7 +22,7 @@ const mimeExtensions = {
 
 export async function init(router) {
     router.get('/health', (_request, response) => {
-        response.send({ ok: true, plugin: info.id, version: '0.2.4' });
+        response.send({ ok: true, plugin: info.id, version: '0.2.5' });
     });
 
     router.get('/secrets/status', (request, response) => {
@@ -118,11 +119,13 @@ export async function init(router) {
                 const saved = await saveResultToUserImages(request, result, {
                     folder: request.body?.saveFolder,
                     filename: request.body?.saveFilename,
+                    imageOutput: request.body?.imageOutput,
                 });
 
                 result.path = saved.path;
                 result.filename = saved.filename;
                 result.format = saved.format;
+                result.data = saved.data;
             }
 
             response.send(result);
@@ -182,10 +185,15 @@ async function saveResultToUserImages(request, result, options = {}) {
         throw new Error('Generated image data is empty.');
     }
 
-    const format = normalizeImageFormat(result?.format);
     const folder = sanitizePathSegment(options.folder) || 'DualImage';
     const filenameBase = sanitizePathSegment(removeFileExtensionFromName(String(options.filename || ''))) || `dual-image-${Date.now()}`;
-    const filename = `${filenameBase}.${format}`;
+    const imageBuffer = Buffer.from(data, 'base64');
+    if (!imageBuffer.length) {
+        throw new Error('Generated image data is invalid.');
+    }
+
+    const output = await prepareImageForChat(imageBuffer, result?.format, options.imageOutput);
+    const filename = `${filenameBase}.${output.format}`;
     const targetDirectory = path.join(userImagesDirectory, folder);
     let targetPath = path.join(targetDirectory, filename);
 
@@ -195,25 +203,96 @@ async function saveResultToUserImages(request, result, options = {}) {
 
     await fs.promises.mkdir(targetDirectory, { recursive: true });
     targetPath = await getUniqueFilePath(targetPath);
-
-    const imageBuffer = Buffer.from(data, 'base64');
-    if (!imageBuffer.length) {
-        throw new Error('Generated image data is invalid.');
-    }
-
-    await fs.promises.writeFile(targetPath, new Uint8Array(imageBuffer));
+    await fs.promises.writeFile(targetPath, new Uint8Array(output.buffer));
 
     return {
         path: clientRelativePath(userRootDirectory, targetPath),
         filename: path.basename(targetPath),
-        format,
+        format: output.format,
+        data: output.buffer.toString('base64'),
     };
+}
+
+async function prepareImageForChat(inputBuffer, originalFormat, options = {}) {
+    const outputOptions = normalizeImageOutputOptions(options);
+    if (!outputOptions.forceJpeg) {
+        return {
+            buffer: inputBuffer,
+            format: normalizeImageFormat(originalFormat),
+        };
+    }
+
+    const { Jimp, JimpMime } = await loadJimpTools();
+    const image = await Jimp.read(inputBuffer);
+    const width = Number(image.bitmap?.width) || 0;
+    const height = Number(image.bitmap?.height) || 0;
+    const maxSide = outputOptions.maxSide;
+
+    if (maxSide > 0 && Math.max(width, height) > maxSide) {
+        const ratio = width >= height ? maxSide / width : maxSide / height;
+        image.resize({
+            w: Math.max(1, Math.round(width * ratio)),
+            h: Math.max(1, Math.round(height * ratio)),
+        });
+    }
+
+    const buffer = await image.getBuffer(JimpMime.jpeg, {
+        quality: outputOptions.jpegQuality,
+        jpegColorSpace: 'ycbcr',
+    });
+
+    return {
+        buffer: Buffer.from(buffer),
+        format: 'jpg',
+    };
+}
+
+function normalizeImageOutputOptions(options = {}) {
+    const jpegQuality = clampInteger(options.jpegQuality, 1, 95, 82);
+    const maxSide = clampInteger(options.maxSide, 0, 4096, 1024);
+    return {
+        forceJpeg: options.forceJpeg !== false,
+        jpegQuality,
+        maxSide,
+    };
+}
+
+async function loadJimpTools() {
+    if (!jimpToolsPromise) {
+        jimpToolsPromise = (async () => {
+            const root = findSillyTavernRoot(pluginDirectory);
+            return await import(pathToFileURL(path.join(root, 'src', 'jimp.js')).href);
+        })();
+    }
+
+    return await jimpToolsPromise;
+}
+
+function findSillyTavernRoot(startDirectory) {
+    let current = startDirectory;
+    while (current && current !== path.dirname(current)) {
+        if (fs.existsSync(path.join(current, 'src', 'jimp.js'))) {
+            return current;
+        }
+        current = path.dirname(current);
+    }
+
+    throw new Error('SillyTavern Jimp image processor was not found.');
 }
 
 function normalizeImageFormat(format) {
     const normalized = String(format || 'png').toLowerCase().replace(/^\./, '');
     const safeFormat = normalized === 'jpeg' ? 'jpg' : normalized;
     return saveableImageFormats.has(safeFormat) ? safeFormat : 'png';
+}
+
+function clampInteger(value, min, max, fallback) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+        return fallback;
+    }
+
+    return Math.min(max, Math.max(min, Math.round(number)));
 }
 
 function sanitizePathSegment(value) {
