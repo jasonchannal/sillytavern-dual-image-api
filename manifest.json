@@ -5,9 +5,9 @@
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "local",
+    "author": "jasonchannal",
     "version": "0.1.0",
-    "homePage": "https://github.com/SillyTavern/SillyTavern",
+    "homePage": "https://github.com/jasonchannal/sillytavern-dual-image-api",
     "hooks": {
         "activate": "init"
     }

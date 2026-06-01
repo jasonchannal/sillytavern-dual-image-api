@@ -3,33 +3,35 @@ import {
     MEDIA_DISPLAY,
     MEDIA_SOURCE,
     MEDIA_TYPE,
-} from '../../constants.js';
+} from '/scripts/constants.js';
 import {
     event_types,
     eventSource,
     getRequestHeaders,
     saveSettingsDebounced,
     systemUserName,
-} from '../../../script.js';
+} from '/script.js';
 import {
     extension_settings,
     getContext,
     renderExtensionTemplateAsync,
-} from '../../extensions.js';
-import { getMessageTimeStamp } from '../../RossAscends-mods.js';
-import { saveBase64AsFile } from '../../utils.js';
-import { Popup } from '../../popup.js';
-import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
-import { SlashCommand } from '../../slash-commands/SlashCommand.js';
+} from '/scripts/extensions.js';
+import { getMessageTimeStamp } from '/scripts/RossAscends-mods.js';
+import { saveBase64AsFile } from '/scripts/utils.js';
+import { Popup } from '/scripts/popup.js';
+import { SlashCommandParser } from '/scripts/slash-commands/SlashCommandParser.js';
+import { SlashCommand } from '/scripts/slash-commands/SlashCommand.js';
 import {
     ARGUMENT_TYPE,
     SlashCommandArgument,
     SlashCommandNamedArgument,
-} from '../../slash-commands/SlashCommandArgument.js';
+} from '/scripts/slash-commands/SlashCommandArgument.js';
 
 export { MODULE_NAME };
 
-const MODULE_NAME = new URL('.', import.meta.url).pathname.split('/').filter(Boolean).pop() || 'dual-image-api';
+const modulePath = new URL('.', import.meta.url).pathname;
+const moduleFolder = modulePath.split('/').filter(Boolean).pop() || 'dual-image-api';
+const MODULE_NAME = modulePath.includes('/third-party/') ? `third-party/${moduleFolder}` : moduleFolder;
 const SETTINGS_KEY = 'dualImageApi';
 const API_BASE = '/api/plugins/dual-image-api';
 
