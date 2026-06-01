@@ -45,17 +45,22 @@ const AUTO_PROMPT_INJECTION_KEY = 'dual-image-api-auto-inline-prompt';
 const AUTO_PROMPT_COMMENT_RE = /<!--\s*DUAL_IMAGE_PROMPT\s*:\s*([\s\S]*?)-->/i;
 const AUTO_PROMPT_TAG_RE = /<dual_image_prompt>\s*([\s\S]*?)<\/dual_image_prompt>/i;
 const AUTO_PROMPT_BRACKET_RE = /\[dual_image_prompt\]\s*([\s\S]*?)\[\/dual_image_prompt\]/i;
+const AUTO_PLACEHOLDER_RE = /<!--\s*DUAL_IMAGE_PLACEHOLDER(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_PLACEHOLDER\s*-->/i;
 
 const defaultAutoInstructionTemplate = `For this reply, continue the roleplay normally.
-At the very end of your response, append exactly one image prompt marker:
-[dual_image_prompt]concise English image-generation prompt, or SKIP[/dual_image_prompt]
+If the reply contains a drawable visual scene, append exactly this placeholder and image prompt marker at the very end:
+<!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->
+[dual_image_prompt]concise English image-generation prompt[/dual_image_prompt]
+
+If there is no useful visual scene, append only:
+[dual_image_prompt]SKIP[/dual_image_prompt]
 
 Rules for the marker:
-- Do not mention the marker, the image prompt, or these rules in the visible reply.
+- Do not mention the marker, placeholder, image prompt, or these rules in the visible reply.
 - If the reply contains a drawable visual scene, write one concise English prompt describing visible characters, action, setting, mood, clothing, camera/framing, and lighting.
 - Do not include dialogue, internal thoughts, UI text, explanations, JSON, markdown, or labels inside the image prompt.
 - If there is no useful visual scene, use SKIP.
-- Keep the marker as the final text after the visible reply.`;
+- Keep the placeholder and marker as the final text after the visible reply.`;
 
 let activeAbortController = null;
 let autoHooksRegistered = false;
@@ -95,6 +100,7 @@ const defaultSettings = {
     allowNsfw: false,
     showModeNote: true,
     defaultMode: 'auto',
+    retryCount: 2,
     classifier: {
         nsfwThreshold: 3,
         nsfwKeywords: [
@@ -220,6 +226,12 @@ function bindSettings() {
 
     $('#dual_image_threshold').val(current.classifier.nsfwThreshold).on('input', () => {
         current.classifier.nsfwThreshold = Number($('#dual_image_threshold').val()) || defaultSettings.classifier.nsfwThreshold;
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_retry_count').val(current.retryCount).on('input', () => {
+        const value = Number($('#dual_image_retry_count').val());
+        current.retryCount = Number.isFinite(value) ? clamp(Math.floor(value), 0, 10) : defaultSettings.retryCount;
         saveSettingsDebounced();
     });
 
@@ -450,29 +462,47 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
     const profile = settings().profiles[decision.mode];
     const abortController = new AbortController();
     activeAbortController = abortController;
-    setStatus(`${statusPrefix} ${decision.mode.toUpperCase()} 生成...`);
     const imageTarget = getGeneratedImageTarget();
+    const retryCount = getRetryCount(options.retryCount);
+    const maxAttempts = retryCount + 1;
 
     try {
-        const result = await fetchJson('/generate', {
-            method: 'POST',
-            signal: abortController.signal,
-            body: {
-                prompt,
-                mode: decision.mode,
-                profile: sanitizeProfile(profile),
-                saveToUserImages: true,
-                saveFolder: imageTarget.folderName,
-                saveFilename: imageTarget.filename,
-            },
-        });
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            setStatus(`${statusPrefix} ${decision.mode.toUpperCase()} 生成${maxAttempts > 1 ? `（${attempt}/${maxAttempts}）` : ''}...`);
 
-        if (!result?.path && !result?.data) {
-            throw new Error('服务端没有返回图片。');
+            try {
+                const result = await fetchJson('/generate', {
+                    method: 'POST',
+                    signal: abortController.signal,
+                    body: {
+                        prompt,
+                        mode: decision.mode,
+                        profile: sanitizeProfile(profile),
+                        saveToUserImages: true,
+                        saveFolder: imageTarget.folderName,
+                        saveFilename: imageTarget.filename,
+                    },
+                });
+
+                if (!result?.path && !result?.data) {
+                    throw new Error('服务端没有返回图片。');
+                }
+
+                const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', prompt, imageTarget);
+                return { prompt, imagePath, mode: decision.mode, attempts: attempt };
+            } catch (error) {
+                if (abortController.signal.aborted || attempt >= maxAttempts) {
+                    throw error;
+                }
+
+                const message = error?.message || String(error);
+                setStatus(`生成失败，正在重试 ${attempt}/${retryCount}：${message}`);
+                await options.onRetry?.({ attempt, retryCount, error });
+                await delay(Math.min(5000, 1000 * attempt));
+            }
         }
 
-        const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', prompt, imageTarget);
-        return { prompt, imagePath, mode: decision.mode };
+        return null;
     } catch (error) {
         if (abortController.signal.aborted) {
             setStatus('生成已取消。');
@@ -487,6 +517,9 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
         setStatus(`生成失败：${message}`);
         if (showToasts) {
             toastr.error(message, 'Dual Image API');
+        }
+        if (options.throwOnError) {
+            throw error;
         }
         return null;
     } finally {
@@ -673,15 +706,19 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
     }
 
     setStatus('正在读取 AI 回复里的配图提示词...');
-    const inlinePrompt = await consumeInlineImagePrompt(messageId);
+    const inlinePrompt = extractInlineImagePrompt(message.mes);
     let prompt = inlinePrompt.prompt;
     let promptSource = 'inline_prompt';
+    let messageText = inlinePrompt.found ? inlinePrompt.cleanedText : message.mes;
 
     if (!inlinePrompt.found) {
         prompt = buildFallbackPromptFromMessage(message);
         promptSource = 'message_fallback';
 
         if (!prompt) {
+            if (AUTO_PLACEHOLDER_RE.test(message.mes || '')) {
+                await updateAutoImageMessageText(messageId, removeAutoImagePlaceholders(message.mes));
+            }
             await markAutoIllustrationSkipped(messageId, 'missing_inline_prompt');
             setStatus('自动配图跳过：AI 回复里没有找到配图提示词标记，也没有可用正文。');
             return;
@@ -689,24 +726,172 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
     }
 
     if (!prompt) {
+        if (inlinePrompt.found && inlinePrompt.cleanedText !== message.mes) {
+            await updateAutoImageMessageText(messageId, removeAutoImagePlaceholders(inlinePrompt.cleanedText));
+        }
         await markAutoIllustrationSkipped(messageId, 'skip_token');
         setStatus('自动配图跳过：这条回复没有可绘制场景。');
         return;
     }
 
-    const generated = await createGeneratedImage(prompt, 'auto', {
-        showToasts: false,
-        abortActive: false,
-        statusPrefix: '正在自动配图，使用',
-    });
+    const placeholderId = createPlaceholderId(messageId);
+    await ensureAutoImagePlaceholder(messageId, placeholderId, messageText, prompt, promptSource);
 
-    if (!generated) {
+    try {
+        const generated = await createGeneratedImage(prompt, 'auto', {
+            showToasts: false,
+            abortActive: false,
+            statusPrefix: '正在自动配图，使用',
+            throwOnError: true,
+            onRetry: async ({ attempt, retryCount, error }) => {
+                const messageText = `配图生成失败，正在重试 ${attempt}/${retryCount}...`;
+                await updateAutoImagePlaceholderText(messageId, placeholderId, messageText, error);
+            },
+        });
+
+        if (!generated) {
+            throw new Error('生成未完成。');
+        }
+
+        await replaceAutoImagePlaceholder(messageId, placeholderId, formatImageMarkdown(generated.imagePath), {
+            done: true,
+            mode: generated.mode,
+            prompt: generated.prompt,
+            prompt_source: promptSource,
+            image_path: generated.imagePath,
+            attempts: generated.attempts || 1,
+            inserted_at: new Date().toISOString(),
+        });
+        setStatus(`自动配图完成：${generated.mode.toUpperCase()}`);
+        toastr.success('已为 AI 回复插入配图。', 'Dual Image API');
+    } catch (error) {
+        const retryCount = getRetryCount();
+        await replaceAutoImagePlaceholder(messageId, placeholderId, formatAutoImageFailure(error, retryCount), {
+            done: true,
+            failed: true,
+            prompt,
+            prompt_source: promptSource,
+            retry_count: retryCount,
+            error: error?.message || String(error),
+            inserted_at: new Date().toISOString(),
+        });
+        throw error;
+    }
+}
+
+async function ensureAutoImagePlaceholder(messageId, placeholderId, text, prompt, promptSource) {
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    if (!message) {
+        throw new Error('找不到要插入占位符的消息。');
+    }
+
+    const placeholder = createAutoImagePlaceholder(placeholderId, '正在生成配图...');
+    const sourceText = String(text || message.mes || '').trimEnd();
+    const nextText = AUTO_PLACEHOLDER_RE.test(sourceText)
+        ? sourceText.replace(AUTO_PLACEHOLDER_RE, placeholder)
+        : `${sourceText}${sourceText ? '\n\n' : ''}${placeholder}`;
+
+    message.extra = message.extra || {};
+    message.extra.dual_image_auto = {
+        done: false,
+        pending: true,
+        prompt,
+        prompt_source: promptSource,
+        placeholder_id: placeholderId,
+        source_hash: hashString(sourceText),
+        inserted_at: new Date().toISOString(),
+    };
+
+    await updateAutoImageMessageText(messageId, nextText);
+}
+
+async function updateAutoImagePlaceholderText(messageId, placeholderId, label, error = null) {
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    if (!message) {
         return;
     }
 
-    await attachImageToMessage(messageId, generated.prompt, generated.imagePath, generated.mode, promptSource);
-    setStatus(`自动配图完成：${generated.mode.toUpperCase()}`);
-    toastr.success('已为 AI 回复插入配图。', 'Dual Image API');
+    const pattern = getAutoImagePlaceholderRegex(placeholderId);
+    const nextText = pattern.test(message.mes)
+        ? message.mes.replace(pattern, createAutoImagePlaceholder(placeholderId, label))
+        : `${String(message.mes || '').trimEnd()}\n\n${createAutoImagePlaceholder(placeholderId, label)}`;
+
+    message.extra = message.extra || {};
+    message.extra.dual_image_auto = {
+        ...(message.extra.dual_image_auto || {}),
+        pending: true,
+        last_error: error?.message || String(error || ''),
+        updated_at: new Date().toISOString(),
+    };
+
+    await updateAutoImageMessageText(messageId, nextText);
+}
+
+async function replaceAutoImagePlaceholder(messageId, placeholderId, replacement, metadata) {
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    if (!message) {
+        throw new Error('找不到要替换占位符的消息。');
+    }
+
+    const pattern = getAutoImagePlaceholderRegex(placeholderId);
+    const currentText = String(message.mes || '');
+    const nextText = pattern.test(currentText)
+        ? currentText.replace(pattern, () => replacement)
+        : `${currentText.trimEnd()}${currentText ? '\n\n' : ''}${replacement}`;
+
+    message.extra = message.extra || {};
+    message.extra.dual_image_auto = {
+        ...(message.extra.dual_image_auto || {}),
+        ...metadata,
+        pending: false,
+        placeholder_id: placeholderId,
+        source_hash: hashString(nextText),
+    };
+
+    await updateAutoImageMessageText(messageId, nextText);
+    setTimeout(() => context.scrollOnMediaLoad(), debounce_timeout.short);
+}
+
+async function updateAutoImageMessageText(messageId, text) {
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    if (!message) {
+        return;
+    }
+
+    message.mes = text;
+    updateMessageBlock(messageId, message);
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    await context.saveChat();
+}
+
+function createPlaceholderId(messageId) {
+    return `di_${messageId}_${Date.now().toString(36)}`;
+}
+
+function createAutoImagePlaceholder(placeholderId, label) {
+    const safeLabel = String(label || '正在生成配图...').replace(/<!--[\s\S]*?-->/g, '').trim() || '正在生成配图...';
+    return `<!--DUAL_IMAGE_PLACEHOLDER:${placeholderId}-->${safeLabel}<!--/DUAL_IMAGE_PLACEHOLDER-->`;
+}
+
+function getAutoImagePlaceholderRegex(placeholderId) {
+    return new RegExp(`<!--\\s*DUAL_IMAGE_PLACEHOLDER:\\s*${escapeRegExp(placeholderId)}\\s*-->\\s*[\\s\\S]*?\\s*<!--\\s*\\/DUAL_IMAGE_PLACEHOLDER\\s*-->`, 'i');
+}
+
+function formatImageMarkdown(imagePath) {
+    return `![AI 配图](${encodeMarkdownUrl(imagePath)})`;
+}
+
+function formatAutoImageFailure(error, retryCount) {
+    const message = error?.message || String(error || '未知错误');
+    return `（配图生成失败，已重试 ${retryCount} 次：${message}）`;
+}
+
+function encodeMarkdownUrl(url) {
+    return encodeURI(String(url || '')).replace(/\(/g, '%28').replace(/\)/g, '%29');
 }
 
 async function consumeInlineImagePrompt(messageId) {
@@ -755,6 +940,10 @@ function removeInlineImagePrompt(text) {
         output = output.replace(toGlobalRegex(pattern), '');
     }
     return output.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+function removeAutoImagePlaceholders(text) {
+    return String(text || '').replace(toGlobalRegex(AUTO_PLACEHOLDER_RE), '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
 }
 
 function buildFallbackPromptFromMessage(message) {
@@ -967,6 +1156,23 @@ function renderTextTemplate(template, variables) {
     return String(template || '').replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, key) => {
         return String(variables[key] ?? '');
     });
+}
+
+function getRetryCount(value = settings().retryCount) {
+    const count = Number(value);
+    return Number.isFinite(count) ? clamp(Math.floor(count), 0, 10) : defaultSettings.retryCount;
+}
+
+function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function escapeRegExp(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function hashString(value) {
