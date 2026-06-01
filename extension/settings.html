@@ -1,0 +1,139 @@
+<div class="dual-image-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Dual Image API</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <div class="dual-image-toolbar">
+                <label for="dual_image_enabled" class="checkbox_label">
+                    <input id="dual_image_enabled" type="checkbox">
+                    <span>启用插件</span>
+                </label>
+                <label for="dual_image_allow_nsfw" class="checkbox_label">
+                    <input id="dual_image_allow_nsfw" type="checkbox">
+                    <span>允许 NSFW 模式</span>
+                </label>
+                <label for="dual_image_show_mode" class="checkbox_label">
+                    <input id="dual_image_show_mode" type="checkbox">
+                    <span>在结果中显示模式</span>
+                </label>
+            </div>
+
+            <div class="flex-container">
+                <div class="flex1">
+                    <label for="dual_image_default_mode">默认模式</label>
+                    <select id="dual_image_default_mode" class="text_pole">
+                        <option value="auto">自动判断</option>
+                        <option value="sfw">强制 SFW</option>
+                        <option value="nsfw">强制 NSFW</option>
+                    </select>
+                </div>
+                <div class="flex1">
+                    <label for="dual_image_threshold">NSFW 判断阈值</label>
+                    <input id="dual_image_threshold" class="text_pole" type="number" min="1" max="20" step="1">
+                </div>
+            </div>
+
+            <div class="dual-image-actions">
+                <div id="dual_image_health" class="menu_button menu_button_icon">
+                    <i class="fa-solid fa-heart-pulse"></i>
+                    <span>检查服务端插件</span>
+                </div>
+                <div id="dual_image_refresh_keys" class="menu_button menu_button_icon">
+                    <i class="fa-solid fa-key"></i>
+                    <span>刷新密钥状态</span>
+                </div>
+                <div id="dual_image_cancel" class="menu_button menu_button_icon">
+                    <i class="fa-solid fa-stop"></i>
+                    <span>取消当前生成</span>
+                </div>
+            </div>
+            <div id="dual_image_status" class="dual-image-status"></div>
+
+            <div class="dual-image-profile" data-profile-panel="sfw">
+                <h4>SFW API</h4>
+                <div class="dual-image-key-row">
+                    <span id="dual_image_sfw_key_state" class="dual-image-key-state">密钥未检查</span>
+                    <input id="dual_image_sfw_api_key" class="text_pole" type="password" autocomplete="off" placeholder="输入新密钥，保存后不会显示">
+                    <div class="menu_button menu_button_icon" data-action="save-key" data-mode="sfw">
+                        <i class="fa-solid fa-floppy-disk"></i>
+                        <span>保存密钥</span>
+                    </div>
+                    <div class="menu_button menu_button_icon" data-action="delete-key" data-mode="sfw">
+                        <i class="fa-solid fa-trash"></i>
+                        <span>删除密钥</span>
+                    </div>
+                </div>
+                <div class="dual-image-grid">
+                    <label>API 类型<select class="text_pole" data-profile="sfw" data-field="apiType"><option value="openai-compatible">OpenAI-compatible</option><option value="generic-json">Generic JSON</option></select></label>
+                    <label>Base URL<input class="text_pole" data-profile="sfw" data-field="baseUrl" placeholder="https://api.example.com"></label>
+                    <label>Endpoint<input class="text_pole" data-profile="sfw" data-field="endpoint" placeholder="/v1/images/generations"></label>
+                    <label>模型<input class="text_pole" data-profile="sfw" data-field="model" placeholder="image-model"></label>
+                    <label>宽度<input class="text_pole" type="number" data-profile="sfw" data-field="width" min="64" step="64"></label>
+                    <label>高度<input class="text_pole" type="number" data-profile="sfw" data-field="height" min="64" step="64"></label>
+                    <label>步数<input class="text_pole" type="number" data-profile="sfw" data-field="steps" min="1" step="1"></label>
+                    <label>CFG<input class="text_pole" type="number" data-profile="sfw" data-field="cfgScale" min="1" step="0.5"></label>
+                    <label>超时毫秒<input class="text_pole" type="number" data-profile="sfw" data-field="timeoutMs" min="1000" step="1000"></label>
+                    <label>结果字段<input class="text_pole" data-profile="sfw" data-field="resultPath" placeholder="data.0.b64_json"></label>
+                </div>
+                <label>提示词前缀<textarea class="text_pole" rows="2" data-profile="sfw" data-field="promptPrefix"></textarea></label>
+                <label>提示词后缀<textarea class="text_pole" rows="2" data-profile="sfw" data-field="promptSuffix"></textarea></label>
+                <label>负面提示词<textarea class="text_pole" rows="2" data-profile="sfw" data-field="negativePrompt"></textarea></label>
+                <div class="dual-image-generic" data-generic-for="sfw">
+                    <label>请求方法<input class="text_pole" data-profile="sfw" data-field="method" placeholder="POST"></label>
+                    <label>密钥 Header<input class="text_pole" data-profile="sfw" data-field="apiKeyHeader" placeholder="Authorization"></label>
+                    <label>密钥前缀<input class="text_pole" data-profile="sfw" data-field="apiKeyPrefix" placeholder="Bearer "></label>
+                    <label>Headers JSON<textarea class="text_pole" rows="3" data-profile="sfw" data-field="headersJson" placeholder="{&quot;Content-Type&quot;:&quot;application/json&quot;}"></textarea></label>
+                    <label>Body 模板<textarea class="text_pole" rows="8" data-profile="sfw" data-field="bodyTemplate"></textarea></label>
+                </div>
+                <div class="menu_button menu_button_icon" data-action="test-profile" data-mode="sfw">
+                    <i class="fa-solid fa-check"></i>
+                    <span>检查 SFW 配置</span>
+                </div>
+            </div>
+
+            <div class="dual-image-profile" data-profile-panel="nsfw">
+                <h4>NSFW API</h4>
+                <div class="dual-image-key-row">
+                    <span id="dual_image_nsfw_key_state" class="dual-image-key-state">密钥未检查</span>
+                    <input id="dual_image_nsfw_api_key" class="text_pole" type="password" autocomplete="off" placeholder="输入新密钥，保存后不会显示">
+                    <div class="menu_button menu_button_icon" data-action="save-key" data-mode="nsfw">
+                        <i class="fa-solid fa-floppy-disk"></i>
+                        <span>保存密钥</span>
+                    </div>
+                    <div class="menu_button menu_button_icon" data-action="delete-key" data-mode="nsfw">
+                        <i class="fa-solid fa-trash"></i>
+                        <span>删除密钥</span>
+                    </div>
+                </div>
+                <div class="dual-image-grid">
+                    <label>API 类型<select class="text_pole" data-profile="nsfw" data-field="apiType"><option value="openai-compatible">OpenAI-compatible</option><option value="generic-json">Generic JSON</option></select></label>
+                    <label>Base URL<input class="text_pole" data-profile="nsfw" data-field="baseUrl" placeholder="https://api.example.com"></label>
+                    <label>Endpoint<input class="text_pole" data-profile="nsfw" data-field="endpoint" placeholder="/v1/images/generations"></label>
+                    <label>模型<input class="text_pole" data-profile="nsfw" data-field="model" placeholder="image-model"></label>
+                    <label>宽度<input class="text_pole" type="number" data-profile="nsfw" data-field="width" min="64" step="64"></label>
+                    <label>高度<input class="text_pole" type="number" data-profile="nsfw" data-field="height" min="64" step="64"></label>
+                    <label>步数<input class="text_pole" type="number" data-profile="nsfw" data-field="steps" min="1" step="1"></label>
+                    <label>CFG<input class="text_pole" type="number" data-profile="nsfw" data-field="cfgScale" min="1" step="0.5"></label>
+                    <label>超时毫秒<input class="text_pole" type="number" data-profile="nsfw" data-field="timeoutMs" min="1000" step="1000"></label>
+                    <label>结果字段<input class="text_pole" data-profile="nsfw" data-field="resultPath" placeholder="data.0.b64_json"></label>
+                </div>
+                <label>提示词前缀<textarea class="text_pole" rows="2" data-profile="nsfw" data-field="promptPrefix"></textarea></label>
+                <label>提示词后缀<textarea class="text_pole" rows="2" data-profile="nsfw" data-field="promptSuffix"></textarea></label>
+                <label>负面提示词<textarea class="text_pole" rows="2" data-profile="nsfw" data-field="negativePrompt"></textarea></label>
+                <div class="dual-image-generic" data-generic-for="nsfw">
+                    <label>请求方法<input class="text_pole" data-profile="nsfw" data-field="method" placeholder="POST"></label>
+                    <label>密钥 Header<input class="text_pole" data-profile="nsfw" data-field="apiKeyHeader" placeholder="Authorization"></label>
+                    <label>密钥前缀<input class="text_pole" data-profile="nsfw" data-field="apiKeyPrefix" placeholder="Bearer "></label>
+                    <label>Headers JSON<textarea class="text_pole" rows="3" data-profile="nsfw" data-field="headersJson" placeholder="{&quot;Content-Type&quot;:&quot;application/json&quot;}"></textarea></label>
+                    <label>Body 模板<textarea class="text_pole" rows="8" data-profile="nsfw" data-field="bodyTemplate"></textarea></label>
+                </div>
+                <div class="menu_button menu_button_icon" data-action="test-profile" data-mode="nsfw">
+                    <i class="fa-solid fa-check"></i>
+                    <span>检查 NSFW 配置</span>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>

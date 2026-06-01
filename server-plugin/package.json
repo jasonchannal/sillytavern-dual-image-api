@@ -1,0 +1,8 @@
+{
+  "name": "st-dual-image-api-server-plugin",
+  "version": "0.1.0",
+  "description": "SillyTavern server plugin for dual SFW/NSFW image API routing.",
+  "main": "index.mjs",
+  "type": "module",
+  "private": true
+}

@@ -1,0 +1,73 @@
+.dual-image-settings .inline-drawer-content {
+    gap: 10px;
+}
+
+.dual-image-toolbar,
+.dual-image-actions,
+.dual-image-key-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.dual-image-status {
+    min-height: 1.4em;
+    opacity: 0.85;
+}
+
+.dual-image-profile {
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    padding-top: 10px;
+    margin-top: 10px;
+}
+
+.dual-image-profile h4 {
+    margin: 0 0 8px;
+}
+
+.dual-image-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px;
+}
+
+.dual-image-settings label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.dual-image-settings .checkbox_label {
+    display: flex;
+    flex-direction: row;
+}
+
+.dual-image-key-row input {
+    min-width: 220px;
+    flex: 1;
+}
+
+.dual-image-key-state {
+    min-width: 92px;
+    font-size: 0.9em;
+}
+
+.dual-image-key-state.is-set {
+    color: var(--SmartThemeQuoteColor);
+}
+
+.dual-image-generic {
+    display: none;
+    margin-top: 8px;
+}
+
+.dual-image-generic.is-visible {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 8px;
+}
+
+#dual_image_wand_button .extensionsMenuExtensionButton {
+    width: 1.25em;
+}

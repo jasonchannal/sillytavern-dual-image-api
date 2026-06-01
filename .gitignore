@@ -1,0 +1,5 @@
+.tmp/
+.data/
+server-plugin/.data/
+node_modules/
+*.log
