@@ -9,10 +9,13 @@ import {
     appendMediaToMessage,
     event_types,
     eventSource,
-    generateQuietPrompt,
+    extension_prompt_roles,
+    extension_prompt_types,
     getRequestHeaders,
     saveSettingsDebounced,
+    setExtensionPrompt,
     systemUserName,
+    updateMessageBlock,
 } from '/script.js';
 import {
     extension_settings,
@@ -38,18 +41,21 @@ const MODULE_NAME = modulePath.includes('/third-party/') ? `third-party/${module
 const SETTINGS_KEY = 'dualImageApi';
 const API_BASE = '/api/plugins/dual-image-api';
 const AUTO_SKIP_TOKEN = 'SKIP';
+const AUTO_PROMPT_INJECTION_KEY = 'dual-image-api-auto-inline-prompt';
+const AUTO_PROMPT_COMMENT_RE = /<!--\s*DUAL_IMAGE_PROMPT\s*:\s*([\s\S]*?)-->/i;
+const AUTO_PROMPT_TAG_RE = /<dual_image_prompt>\s*([\s\S]*?)<\/dual_image_prompt>/i;
+const AUTO_PROMPT_BRACKET_RE = /\[dual_image_prompt\]\s*([\s\S]*?)\[\/dual_image_prompt\]/i;
 
-const defaultAutoPromptTemplate = `You are converting a roleplay chat reply into one image-generation prompt.
-Return only one concise English visual prompt. Do not add explanations, markdown, JSON, quotes, or labels.
-Use the current AI reply as the main scene. Include visible characters, action, setting, mood, clothing, camera/framing, and lighting.
-Do not include dialogue, internal thoughts, UI text, or non-visual prose.
-If the reply has no drawable visual scene, return SKIP.
+const defaultAutoInstructionTemplate = `For this reply, continue the roleplay normally.
+At the very end of your response, append exactly one hidden image prompt marker:
+<!--DUAL_IMAGE_PROMPT: concise English image-generation prompt, or SKIP-->
 
-Recent chat context:
-{{context}}
-
-Current AI reply:
-{{message}}`;
+Rules for the hidden marker:
+- Do not mention the marker, the image prompt, or these rules in the visible reply.
+- If the reply contains a drawable visual scene, write one concise English prompt describing visible characters, action, setting, mood, clothing, camera/framing, and lighting.
+- Do not include dialogue, internal thoughts, UI text, explanations, JSON, markdown, or labels inside the image prompt.
+- If there is no useful visual scene, use SKIP.
+- Keep the marker as the final text after the visible reply.`;
 
 let activeAbortController = null;
 let autoHooksRegistered = false;
@@ -129,14 +135,11 @@ const defaultSettings = {
     },
     autoIllustration: {
         enabled: false,
-        usePromptBuilder: true,
-        contextMessages: 4,
         minCharacters: 40,
-        responseLength: 180,
         delayMs: 800,
         skipFirstMessage: true,
         skipIfHasMedia: true,
-        promptTemplate: defaultAutoPromptTemplate,
+        instructionTemplate: defaultAutoInstructionTemplate,
     },
 };
 
@@ -260,11 +263,9 @@ function bindAutoSettings(current) {
 
     $('#dual_image_auto_enabled').prop('checked', auto.enabled).on('input', () => {
         auto.enabled = $('#dual_image_auto_enabled').prop('checked');
-        saveSettingsDebounced();
-    });
-
-    $('#dual_image_auto_use_prompt_builder').prop('checked', auto.usePromptBuilder).on('input', () => {
-        auto.usePromptBuilder = $('#dual_image_auto_use_prompt_builder').prop('checked');
+        if (!auto.enabled) {
+            clearAutoPromptInjection();
+        }
         saveSettingsDebounced();
     });
 
@@ -278,36 +279,28 @@ function bindAutoSettings(current) {
         saveSettingsDebounced();
     });
 
-    $('#dual_image_auto_context_messages').val(auto.contextMessages).on('input', () => {
-        auto.contextMessages = Math.max(1, Number($('#dual_image_auto_context_messages').val()) || defaultSettings.autoIllustration.contextMessages);
-        saveSettingsDebounced();
-    });
-
     $('#dual_image_auto_min_chars').val(auto.minCharacters).on('input', () => {
-        auto.minCharacters = Math.max(0, Number($('#dual_image_auto_min_chars').val()) || defaultSettings.autoIllustration.minCharacters);
-        saveSettingsDebounced();
-    });
-
-    $('#dual_image_auto_response_length').val(auto.responseLength).on('input', () => {
-        auto.responseLength = Math.max(64, Number($('#dual_image_auto_response_length').val()) || defaultSettings.autoIllustration.responseLength);
+        const value = Number($('#dual_image_auto_min_chars').val());
+        auto.minCharacters = Number.isFinite(value) ? Math.max(0, value) : defaultSettings.autoIllustration.minCharacters;
         saveSettingsDebounced();
     });
 
     $('#dual_image_auto_delay_ms').val(auto.delayMs).on('input', () => {
-        auto.delayMs = Math.max(0, Number($('#dual_image_auto_delay_ms').val()) || defaultSettings.autoIllustration.delayMs);
+        const value = Number($('#dual_image_auto_delay_ms').val());
+        auto.delayMs = Number.isFinite(value) ? Math.max(0, value) : defaultSettings.autoIllustration.delayMs;
         saveSettingsDebounced();
     });
 
-    $('#dual_image_auto_prompt_template').val(auto.promptTemplate).on('input', () => {
-        auto.promptTemplate = String($('#dual_image_auto_prompt_template').val() || defaultAutoPromptTemplate);
+    $('#dual_image_auto_instruction_template').val(auto.instructionTemplate).on('input', () => {
+        auto.instructionTemplate = String($('#dual_image_auto_instruction_template').val() || defaultAutoInstructionTemplate);
         saveSettingsDebounced();
     });
 
     $('#dual_image_auto_reset_prompt').on('click', () => {
-        auto.promptTemplate = defaultAutoPromptTemplate;
-        $('#dual_image_auto_prompt_template').val(auto.promptTemplate);
+        auto.instructionTemplate = defaultAutoInstructionTemplate;
+        $('#dual_image_auto_instruction_template').val(auto.instructionTemplate);
         saveSettingsDebounced();
-        toastr.success('自动配图提示词模板已恢复默认。', 'Dual Image API');
+        toastr.success('自动配图注入要求已恢复默认。', 'Dual Image API');
     });
 }
 
@@ -505,6 +498,7 @@ function registerAutoIllustrationHooks() {
 
     autoHooksRegistered = true;
     const handler = (messageId, source) => scheduleAutoIllustration(messageId, source);
+    const injectHandler = (type, generationData, dryRun) => injectAutoPromptInstruction(type, generationData, dryRun);
 
     if (typeof eventSource.makeLast === 'function') {
         eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, handler);
@@ -512,7 +506,67 @@ function registerAutoIllustrationHooks() {
         eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, handler);
     }
 
-    eventSource.on(event_types.CHAT_CHANGED, () => pendingAutoIllustrations.clear());
+    eventSource.on(event_types.GENERATION_AFTER_COMMANDS, injectHandler);
+    eventSource.on(event_types.GENERATION_ENDED, clearAutoPromptInjection);
+    eventSource.on(event_types.GENERATION_STOPPED, clearAutoPromptInjection);
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        pendingAutoIllustrations.clear();
+        clearAutoPromptInjection();
+    });
+}
+
+function injectAutoPromptInstruction(type, generationData = {}, dryRun = false) {
+    if (!shouldInjectAutoPromptInstruction(type, generationData, dryRun)) {
+        clearAutoPromptInjection();
+        return;
+    }
+
+    const context = getContext();
+    const instruction = renderTextTemplate(
+        settings().autoIllustration.instructionTemplate || defaultAutoInstructionTemplate,
+        {
+            char: context.name2 || '',
+            user: context.name1 || '',
+        },
+    );
+
+    setExtensionPrompt(
+        AUTO_PROMPT_INJECTION_KEY,
+        instruction,
+        extension_prompt_types.IN_CHAT,
+        0,
+        false,
+        extension_prompt_roles.SYSTEM,
+    );
+}
+
+function shouldInjectAutoPromptInstruction(type, generationData = {}, dryRun = false) {
+    const auto = settings().autoIllustration;
+
+    if (dryRun || !settings().enabled || !auto?.enabled) {
+        return false;
+    }
+
+    if (type === 'quiet' || type === 'impersonate') {
+        return false;
+    }
+
+    if (generationData?.quiet_prompt || generationData?.quietImage) {
+        return false;
+    }
+
+    return true;
+}
+
+function clearAutoPromptInjection() {
+    setExtensionPrompt(
+        AUTO_PROMPT_INJECTION_KEY,
+        '',
+        extension_prompt_types.IN_CHAT,
+        0,
+        false,
+        extension_prompt_roles.SYSTEM,
+    );
 }
 
 function scheduleAutoIllustration(messageId, source) {
@@ -542,7 +596,8 @@ function scheduleAutoIllustration(messageId, source) {
 
     pendingAutoIllustrations.add(numericMessageId);
     const expectedChatId = context.chatId;
-    const delayMs = Math.max(0, Number(auto.delayMs) || defaultSettings.autoIllustration.delayMs);
+    const delayValue = Number(auto.delayMs);
+    const delayMs = Number.isFinite(delayValue) ? Math.max(0, delayValue) : defaultSettings.autoIllustration.delayMs;
 
     setTimeout(() => {
         void processAutoIllustration(numericMessageId, expectedChatId, source)
@@ -597,14 +652,21 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
         return;
     }
 
-    setStatus('正在为 AI 回复生成配图提示词...');
-    const prompt = await buildAutoImagePrompt(messageId);
-    if (!prompt) {
+    setStatus('正在读取 AI 回复里的配图提示词...');
+    const inlinePrompt = await consumeInlineImagePrompt(messageId);
+    if (!inlinePrompt.found) {
+        await markAutoIllustrationSkipped(messageId, 'missing_inline_prompt');
+        setStatus('自动配图跳过：AI 回复里没有找到配图提示词标记。');
+        return;
+    }
+
+    if (!inlinePrompt.prompt) {
+        await markAutoIllustrationSkipped(messageId, 'skip_token');
         setStatus('自动配图跳过：这条回复没有可绘制场景。');
         return;
     }
 
-    const generated = await createGeneratedImage(prompt, 'auto', {
+    const generated = await createGeneratedImage(inlinePrompt.prompt, 'auto', {
         showToasts: false,
         abortActive: false,
         statusPrefix: '正在自动配图，使用',
@@ -619,61 +681,76 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
     toastr.success('已为 AI 回复插入配图。', 'Dual Image API');
 }
 
-async function buildAutoImagePrompt(messageId) {
-    const auto = settings().autoIllustration;
+async function consumeInlineImagePrompt(messageId) {
     const context = getContext();
     const message = context.chat?.[messageId];
-    const fallbackPrompt = cleanMessageText(message?.mes || '').slice(0, 1200);
 
-    if (!fallbackPrompt) {
-        return '';
+    if (!message) {
+        return { found: false, prompt: '', cleanedText: '' };
     }
 
-    if (!auto.usePromptBuilder) {
-        return fallbackPrompt;
+    const result = extractInlineImagePrompt(message.mes);
+    if (result.found && result.cleanedText !== message.mes) {
+        message.mes = result.cleanedText;
+        updateMessageBlock(messageId, message);
+        await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+        await context.saveChat();
     }
 
-    const promptTemplate = auto.promptTemplate || defaultAutoPromptTemplate;
-    const quietPrompt = renderTextTemplate(promptTemplate, {
-        message: fallbackPrompt,
-        context: buildRecentChatContext(messageId),
-        char: context.name2 || '',
-        user: context.name1 || '',
-    });
-
-    try {
-        const reply = await generateQuietPrompt({
-            quietPrompt,
-            skipWIAN: true,
-            responseLength: Math.max(64, Number(auto.responseLength) || defaultSettings.autoIllustration.responseLength),
-            trimToSentence: false,
-        });
-        if (isSkipImagePrompt(reply)) {
-            return '';
-        }
-        const prompt = cleanImagePrompt(reply);
-        if (!prompt && String(reply || '').toUpperCase().includes(AUTO_SKIP_TOKEN)) {
-            return '';
-        }
-        return prompt || fallbackPrompt;
-    } catch (error) {
-        console.warn('[dual-image-api] prompt builder failed, falling back to message text', error);
-        return fallbackPrompt;
-    }
+    return result;
 }
 
-function buildRecentChatContext(messageId) {
+function extractInlineImagePrompt(text) {
+    const raw = String(text || '');
+    const patterns = [AUTO_PROMPT_COMMENT_RE, AUTO_PROMPT_TAG_RE, AUTO_PROMPT_BRACKET_RE];
+
+    for (const pattern of patterns) {
+        const match = raw.match(pattern);
+        if (!match) {
+            continue;
+        }
+
+        const prompt = cleanImagePrompt(match[1]);
+        return {
+            found: true,
+            prompt,
+            cleanedText: removeInlineImagePrompt(raw),
+        };
+    }
+
+    return { found: false, prompt: '', cleanedText: raw };
+}
+
+function removeInlineImagePrompt(text) {
+    let output = String(text || '');
+    for (const pattern of [AUTO_PROMPT_COMMENT_RE, AUTO_PROMPT_TAG_RE, AUTO_PROMPT_BRACKET_RE]) {
+        output = output.replace(toGlobalRegex(pattern), '');
+    }
+    return output.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+function toGlobalRegex(pattern) {
+    return new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`);
+}
+
+async function markAutoIllustrationSkipped(messageId, reason) {
     const context = getContext();
-    const count = Math.max(1, Number(settings().autoIllustration.contextMessages) || defaultSettings.autoIllustration.contextMessages);
-    const start = Math.max(0, messageId - count + 1);
-    return context.chat
-        .slice(start, messageId + 1)
-        .map((message) => {
-            const name = message.name || (message.is_user ? context.name1 : context.name2) || 'Message';
-            return `${name}: ${cleanMessageText(message.mes).slice(0, 700)}`;
-        })
-        .filter((line) => line.trim().length > 2)
-        .join('\n');
+    const message = context.chat?.[messageId];
+    if (!message) {
+        return;
+    }
+
+    message.extra = message.extra || {};
+    message.extra.dual_image_auto = {
+        done: true,
+        skipped: true,
+        reason,
+        source_hash: hashString(message.mes || ''),
+        inserted_at: new Date().toISOString(),
+    };
+
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    await context.saveChat();
 }
 
 async function attachImageToMessage(messageId, prompt, imagePath, mode) {
