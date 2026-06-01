@@ -1,0 +1,1 @@
+# sillytavern-dual-image-api
