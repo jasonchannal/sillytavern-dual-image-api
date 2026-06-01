@@ -566,7 +566,7 @@ function injectAutoPromptInstruction(type, generationData = {}, dryRun = false) 
 
     const context = getContext();
     const instruction = renderTextTemplate(
-        settings().autoIllustration.instructionTemplate || defaultAutoInstructionTemplate,
+        getAutoInstructionTemplate(),
         {
             char: context.name2 || '',
             user: context.name1 || '',
@@ -599,6 +599,19 @@ function shouldInjectAutoPromptInstruction(type, generationData = {}, dryRun = f
     }
 
     return true;
+}
+
+function getAutoInstructionTemplate() {
+    const template = String(settings().autoIllustration.instructionTemplate || defaultAutoInstructionTemplate);
+    if (template.includes('DUAL_IMAGE_PLACEHOLDER')) {
+        return template;
+    }
+
+    return `${template}
+
+Additional required placeholder rule:
+- If you output a non-SKIP [dual_image_prompt], put this exact placeholder immediately before it:
+<!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->`;
 }
 
 function clearAutoPromptInjection() {
