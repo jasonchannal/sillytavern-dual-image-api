@@ -103,6 +103,7 @@ const defaultSettings = {
     showModeNote: true,
     defaultMode: 'auto',
     retryCount: 2,
+    imageOutputMode: 'jpeg',
     jpegQuality: 82,
     maxImageSide: 1024,
     classifier: {
@@ -236,6 +237,11 @@ function bindSettings() {
     $('#dual_image_retry_count').val(current.retryCount).on('input', () => {
         const value = Number($('#dual_image_retry_count').val());
         current.retryCount = Number.isFinite(value) ? clamp(Math.floor(value), 0, 10) : defaultSettings.retryCount;
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_output_mode').val(current.imageOutputMode || defaultSettings.imageOutputMode).on('change', () => {
+        current.imageOutputMode = String($('#dual_image_output_mode').val() || defaultSettings.imageOutputMode);
         saveSettingsDebounced();
     });
 
@@ -1141,8 +1147,9 @@ function softenSfwPromptTerms(value) {
 }
 
 function getImageOutputOptions() {
+    const mode = String(settings().imageOutputMode || defaultSettings.imageOutputMode);
     return {
-        forceJpeg: true,
+        forceJpeg: mode !== 'original',
         jpegQuality: getJpegQuality(),
         maxSide: getMaxImageSide(),
     };
