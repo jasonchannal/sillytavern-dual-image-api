@@ -1,6 +1,6 @@
 {
   "name": "sillytavern-dual-image-api",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "description": "SillyTavern extension and server plugin for SFW/NSFW image API routing.",
   "main": "server-plugin/index.mjs",
   "type": "module",

@@ -897,6 +897,14 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                 }
 
                 const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', normalizedPrompt, imageTarget);
+                await notifyGeneratedImage(options, {
+                    imagePath,
+                    imageIndex,
+                    generationCount,
+                    attempt,
+                    mode: decision.mode,
+                    prompt: imagePrompt,
+                });
                 return { imagePath, attempts: attempt, imageIndex };
             } catch (error) {
                 if (abortController.signal.aborted || attempt >= maxAttempts) {
@@ -986,6 +994,18 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
         if (activeAbortController === abortController) {
             activeAbortController = null;
         }
+    }
+}
+
+async function notifyGeneratedImage(options, payload) {
+    if (typeof options.onImage !== 'function') {
+        return;
+    }
+
+    try {
+        await options.onImage(payload);
+    } catch (error) {
+        console.warn('[dual-image-api] failed to update partial image result', error);
     }
 }
 
@@ -1411,6 +1431,7 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
 
     const placeholderId = createPlaceholderId(messageId);
     await ensureAutoImagePlaceholder(messageId, placeholderId, messageText, prompt, promptSource);
+    const partialImages = [];
 
     try {
         const generated = await createGeneratedImage(prompt, 'auto', {
@@ -1418,6 +1439,14 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
             abortActive: false,
             statusPrefix: '正在自动配图，使用',
             throwOnError: true,
+            onImage: async ({ imagePath, imageIndex, generationCount }) => {
+                addPartialImageResult(partialImages, imagePath, imageIndex);
+                await updateAutoImagePlaceholderText(
+                    messageId,
+                    placeholderId,
+                    formatPartialImagePlaceholder(partialImages, generationCount),
+                );
+            },
             onRetry: async ({ attempt, retryCount, error, imageIndex, generationCount }) => {
                 const imageLabel = generationCount > 1 ? `第 ${imageIndex + 1}/${generationCount} 张` : '配图';
                 const messageText = `${imageLabel}生成失败，正在重试 ${attempt}/${retryCount}...`;
@@ -1485,6 +1514,7 @@ async function retryAutoImageForMessage(messageId) {
     const placeholderId = createPlaceholderId(messageId);
     const promptSource = metadata.prompt_source || 'manual_retry';
     const baseText = removePriorAutoImageResult(message.mes, metadata);
+    const partialImages = [];
 
     try {
         await ensureAutoImagePlaceholder(messageId, placeholderId, baseText, prompt, promptSource);
@@ -1494,6 +1524,14 @@ async function retryAutoImageForMessage(messageId) {
             abortActive: false,
             statusPrefix: '正在重新配图，使用',
             throwOnError: true,
+            onImage: async ({ imagePath, imageIndex, generationCount }) => {
+                addPartialImageResult(partialImages, imagePath, imageIndex);
+                await updateAutoImagePlaceholderText(
+                    messageId,
+                    placeholderId,
+                    formatPartialImagePlaceholder(partialImages, generationCount),
+                );
+            },
             onRetry: async ({ attempt, retryCount, error, imageIndex, generationCount }) => {
                 const imageLabel = generationCount > 1 ? `第 ${imageIndex + 1}/${generationCount} 张` : '重新配图';
                 const messageText = `${imageLabel}生成失败，正在重试 ${attempt}/${retryCount}...`;
@@ -1656,6 +1694,26 @@ function formatImageMarkdownList(imagePaths) {
     return normalizeImagePathList(imagePaths)
         .map((imagePath, index) => `${formatImageMarkdown(imagePath)}<!--DUAL_IMAGE_RESULT:${index + 1}:${hashString(imagePath)}-->`)
         .join('\n\n');
+}
+
+function addPartialImageResult(partialImages, imagePath, imageIndex) {
+    const path = String(imagePath || '').trim();
+    if (!path || partialImages.some(item => item.path === path)) {
+        return;
+    }
+
+    partialImages.push({ path, imageIndex: Number(imageIndex) || 0 });
+    partialImages.sort((left, right) => left.imageIndex - right.imageIndex);
+}
+
+function formatPartialImagePlaceholder(partialImages, generationCount) {
+    const imagePaths = partialImages.map(item => item.path);
+    const total = getConcurrentGenerationCount(generationCount);
+    const status = imagePaths.length < total
+        ? `正在继续生成其余配图...（${imagePaths.length}/${total}）`
+        : `配图生成完成（${imagePaths.length}/${total}）`;
+
+    return `${formatImageMarkdownList(imagePaths)}\n\n${status}`;
 }
 
 function getGeneratedResultImagePaths(generated) {
