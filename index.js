@@ -1824,6 +1824,7 @@ function buildCharacterConsistencyPayload(scenePrompt, mode) {
             : cleanImagePrompt(profile.visualPrompt) || String(profile.visualPrompt || '').trim();
         return {
             name: profile.name,
+            promptName: getPromptSafeCharacterName(profile),
             visualPrompt,
             referenceImage: String(profile.referenceImage || '').trim(),
             referenceWeight: clamp(Number(profile.referenceWeight) || state.referenceWeight || defaultSettings.characterConsistency.referenceWeight, 0, 2),
@@ -1834,7 +1835,7 @@ function buildCharacterConsistencyPayload(scenePrompt, mode) {
         ? characters
             .filter(profile => profile.referenceImage)
             .map(profile => ({
-                name: profile.name,
+                name: profile.promptName || '',
                 url: profile.referenceImage,
                 weight: profile.referenceWeight,
             }))
@@ -1850,12 +1851,16 @@ function applyCharacterConsistencyToPrompt(basePrompt, payload, mode) {
     }
 
     const characterPrompts = payload.characters.map(character => {
-        const parts = [
-            character.name,
+        const appearance = [
             character.visualPrompt,
             character.referenceImage ? 'match the provided reference image identity' : '',
-        ].filter(Boolean);
-        return parts.join(': ');
+        ].filter(Boolean).join(', ');
+
+        if (character.promptName) {
+            return `${character.promptName}: ${appearance}`;
+        }
+
+        return `character appearance: ${appearance}`;
     });
 
     const identityRule = mode === 'sfw'
@@ -1890,8 +1895,85 @@ function getMatchedCharacterProfiles(scenePrompt, state = getCharacterConsistenc
 }
 
 function characterProfileMatchesPrompt(profile, normalizedPrompt) {
-    const names = [profile.name, ...splitCharacterAliases(profile.aliases)].map(normalizePrompt).filter(Boolean);
+    const names = [profile.name, ...splitCharacterAliases(profile.aliases)]
+        .map(name => sanitizeCharacterNameForPrompt(name))
+        .map(normalizePrompt)
+        .filter(Boolean);
     return names.some(name => normalizedPrompt.includes(name));
+}
+
+function getPromptSafeCharacterName(profile) {
+    const candidates = [...splitCharacterAliases(profile.aliases), profile.name];
+    for (const candidate of candidates) {
+        const name = sanitizeCharacterNameForPrompt(candidate);
+        if (name) {
+            return name;
+        }
+    }
+
+    return '';
+}
+
+function sanitizeCharacterNameForPrompt(value) {
+    const raw = String(value || '')
+        .replace(/[`*_#]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!raw) {
+        return '';
+    }
+
+    const withoutBrackets = raw
+        .replace(/\s*[\(（\[][^)）\]]{1,40}[\)）\]]\s*/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const candidates = [withoutBrackets, raw]
+        .flatMap(text => text.split(/[|｜/\\:：,，;；\n]/))
+        .map(text => text.trim())
+        .filter(Boolean);
+
+    for (const candidate of candidates) {
+        const cleaned = candidate
+            .replace(/^[-\s]+|[-\s]+$/g, '')
+            .replace(/^["'“”]+|["'“”]+$/g, '')
+            .trim();
+        if (isLikelyCharacterName(cleaned)) {
+            return cleaned;
+        }
+    }
+
+    return '';
+}
+
+function isLikelyCharacterName(value) {
+    const text = String(value || '').trim();
+    if (!text || text.length > 32 || hasStrongPromptNoiseKeywords(text) || countPromptNoiseKeywords(text) > 0) {
+        return false;
+    }
+
+    if (/[<>{}\[\]【】《》]|https?:|www\.|@|#|\d{2,}/i.test(text)) {
+        return false;
+    }
+
+    const lower = text.toLowerCase();
+    const nonNameWords = [
+        'character', 'assistant', 'user', 'narrator', 'scenario', 'story', 'roleplay',
+        'rpg', 'bot', 'card', 'preset', 'prompt', 'nsfw', 'sfw', 'ntr',
+        '角色卡', '角色设定', '设定', '剧情', '故事', '玩法', '世界观', '群聊', '模板',
+        '女主', '男主', '女友', '男友', '妹妹', '姐姐', '母亲', '老师', '同学', '转校生',
+        '纯爱', '后宫', '校园', '调教',
+    ];
+    if (nonNameWords.some(word => lower.includes(word.toLowerCase()))) {
+        return false;
+    }
+
+    const cjkCount = (text.match(/[\u3400-\u9fff]/g) || []).length;
+    if (cjkCount > 0) {
+        return text.length <= 8 && !/[.!?！？。；;=+~]/.test(text);
+    }
+
+    const words = text.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+    return words.length > 0 && words.length <= 3 && text.length <= 32 && !/[^A-Za-z\s'.-]/.test(text);
 }
 
 function splitCharacterAliases(value) {
