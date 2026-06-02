@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -8,6 +10,7 @@ export const info = {
     description: 'Routes SillyTavern image generation requests to separate SFW and NSFW third-party APIs.',
 };
 
+const pluginVersion = '0.2.17';
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
 const validModes = new Set(['sfw', 'nsfw']);
 const saveableImageFormats = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
@@ -29,7 +32,7 @@ const extensionMimeTypes = {
 
 export async function init(router) {
     router.get('/health', (_request, response) => {
-        response.send({ ok: true, plugin: info.id, version: '0.2.10' });
+        response.send({ ok: true, plugin: info.id, version: pluginVersion });
     });
 
     router.get('/secrets/status', (request, response) => {
@@ -548,29 +551,23 @@ function buildUrl(baseUrl, endpoint) {
 }
 
 async function requestJson(url, options) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
+    const result = await requestHttp(url, {
+        method: options.method,
+        headers: options.headers,
+        body: options.body,
+        timeoutMs: options.timeoutMs,
+        responseType: 'text',
+    });
+
+    const text = result.body.toString('utf8');
+    if (result.status < 200 || result.status >= 300) {
+        throw new Error(`Image API returned ${result.status}: ${redactSecretLikeText(text).slice(0, 500)}`);
+    }
 
     try {
-        const result = await fetch(url, {
-            method: options.method,
-            headers: options.headers,
-            body: options.body,
-            signal: controller.signal,
-        });
-
-        const text = await result.text();
-        if (!result.ok) {
-            throw new Error(`Image API returned ${result.status}: ${redactSecretLikeText(text).slice(0, 500)}`);
-        }
-
-        try {
-            return JSON.parse(text);
-        } catch {
-            throw new Error('Image API did not return valid JSON.');
-        }
-    } finally {
-        clearTimeout(timeout);
+        return JSON.parse(text);
+    } catch {
+        throw new Error('Image API did not return valid JSON.');
     }
 }
 
@@ -627,21 +624,79 @@ async function normalizeImageValue(value) {
 }
 
 async function downloadImage(url) {
-    const result = await fetch(url, { headers: { Accept: 'image/*' } });
-    if (!result.ok) {
+    const result = await requestHttp(url, {
+        method: 'GET',
+        headers: { Accept: 'image/*' },
+        timeoutMs: 120000,
+        responseType: 'buffer',
+    });
+    if (result.status < 200 || result.status >= 300) {
         throw new Error(`Failed to download generated image: ${result.status}`);
     }
 
-    const contentType = String(result.headers.get('content-type') || '').split(';')[0].toLowerCase();
+    const contentType = String(result.headers['content-type'] || '').split(';')[0].toLowerCase();
     if (!contentType.startsWith('image/')) {
         throw new Error('Generated image URL did not return an image.');
     }
 
-    const buffer = Buffer.from(await result.arrayBuffer());
     return {
-        data: buffer.toString('base64'),
+        data: result.body.toString('base64'),
         format: mimeExtensions[contentType] || 'png',
     };
+}
+
+async function requestHttp(url, options, redirectCount = 0) {
+    if (redirectCount > 3) {
+        throw new Error('Image API redirected too many times.');
+    }
+
+    const target = new URL(url);
+    const client = target.protocol === 'https:' ? https : http;
+    const body = options.body === undefined || options.body === null ? null : Buffer.from(String(options.body));
+    const headers = { ...(options.headers || {}) };
+    if (body && headers['Content-Length'] === undefined && headers['content-length'] === undefined) {
+        headers['Content-Length'] = String(body.length);
+    }
+
+    return await new Promise((resolve, reject) => {
+        const request = client.request({
+            protocol: target.protocol,
+            hostname: target.hostname,
+            port: target.port || undefined,
+            path: `${target.pathname}${target.search}`,
+            method: options.method || 'GET',
+            headers,
+        }, (response) => {
+            const status = Number(response.statusCode || 0);
+            const location = response.headers.location;
+            if ([301, 302, 303, 307, 308].includes(status) && location) {
+                response.resume();
+                const nextUrl = new URL(location, target).toString();
+                requestHttp(nextUrl, options, redirectCount + 1).then(resolve, reject);
+                return;
+            }
+
+            const chunks = [];
+            response.on('data', chunk => chunks.push(chunk));
+            response.on('end', () => {
+                resolve({
+                    status,
+                    headers: response.headers,
+                    body: Buffer.concat(chunks),
+                });
+            });
+        });
+
+        request.setTimeout(Number(options.timeoutMs) || 120000, () => {
+            request.destroy(new Error('Image API request timed out before a response was received.'));
+        });
+        request.on('error', reject);
+
+        if (body) {
+            request.write(body);
+        }
+        request.end();
+    });
 }
 
 function getByPath(value, dotPath) {
