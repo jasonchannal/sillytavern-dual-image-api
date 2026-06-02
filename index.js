@@ -123,6 +123,7 @@ const defaultSettings = {
     showModeNote: true,
     defaultMode: 'auto',
     retryCount: 2,
+    concurrentGenerations: 1,
     imageOutputMode: 'jpeg',
     jpegQuality: 82,
     maxImageSide: 1024,
@@ -285,6 +286,12 @@ function bindSettings() {
     $('#dual_image_retry_count').val(current.retryCount).on('input', () => {
         const value = Number($('#dual_image_retry_count').val());
         current.retryCount = Number.isFinite(value) ? clamp(Math.floor(value), 0, 10) : defaultSettings.retryCount;
+        saveSettingsDebounced();
+    });
+
+    $('#dual_image_concurrent_count').val(getConcurrentGenerationCount(current.concurrentGenerations)).on('input', () => {
+        const value = Number($('#dual_image_concurrent_count').val());
+        current.concurrentGenerations = Number.isFinite(value) ? clamp(Math.floor(value), 1, 10) : defaultSettings.concurrentGenerations;
         saveSettingsDebounced();
     });
 
@@ -782,9 +789,10 @@ async function generateImage(prompt, requestedMode = 'auto') {
         return;
     }
 
-    await sendImageMessage(generated.prompt, generated.imagePath, generated.mode);
-    setStatus(`生成完成：${generated.mode.toUpperCase()}`);
-    toastr.success('图片已生成。', 'Dual Image API');
+    await sendImageMessage(generated.prompt, generated.imagePaths || [generated.imagePath], generated.mode);
+    const imageCount = getGeneratedResultImagePaths(generated).length;
+    setStatus(`生成完成：${generated.mode.toUpperCase()}，共 ${imageCount} 张`);
+    toastr.success(`图片已生成：${imageCount} 张。`, 'Dual Image API');
 }
 
 async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}) {
@@ -853,14 +861,20 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
     }
     const abortController = new AbortController();
     activeAbortController = abortController;
-    const imageTarget = getGeneratedImageTarget();
+    const baseImageTarget = getGeneratedImageTarget();
     const imageOutput = getImageOutputOptions();
     const retryCount = getRetryCount(options.retryCount);
     const maxAttempts = retryCount + 1;
+    const generationCount = getConcurrentGenerationCount(options.concurrentGenerations);
 
-    try {
+    const generateOneImage = async (imageIndex) => {
+        const imageNumber = imageIndex + 1;
+        const imageTarget = getGeneratedImageTargetForIndex(baseImageTarget, imageIndex, generationCount);
+
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            setStatus(`${statusPrefix} ${decision.mode.toUpperCase()} 生成${maxAttempts > 1 ? `（${attempt}/${maxAttempts}）` : ''}...`);
+            const countLabel = generationCount > 1 ? `第 ${imageNumber}/${generationCount} 张` : '';
+            const retryLabel = maxAttempts > 1 ? `（${attempt}/${maxAttempts}）` : '';
+            setStatus(`${statusPrefix} ${decision.mode.toUpperCase()} 生成${countLabel}${retryLabel}...`);
 
             try {
                 const result = await fetchJson('/generate', {
@@ -883,21 +897,72 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                 }
 
                 const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', normalizedPrompt, imageTarget);
-                const updatedCharacterConsistency = rememberGeneratedImageAsCharacterReference(imagePath, normalizedPrompt, characterConsistency);
-                return { prompt: imagePrompt, imagePath, mode: decision.mode, attempts: attempt, characterConsistency: updatedCharacterConsistency };
+                return { imagePath, attempts: attempt, imageIndex };
             } catch (error) {
                 if (abortController.signal.aborted || attempt >= maxAttempts) {
                     throw error;
                 }
 
                 const message = error?.message || String(error);
-                setStatus(`生成失败，正在重试 ${attempt}/${retryCount}：${message}`);
-                await options.onRetry?.({ attempt, retryCount, error });
+                const countLabel = generationCount > 1 ? `第 ${imageNumber}/${generationCount} 张` : '';
+                setStatus(`${countLabel}生成失败，正在重试 ${attempt}/${retryCount}：${message}`);
+                await options.onRetry?.({ attempt, retryCount, error, imageIndex, generationCount });
                 await delay(Math.min(5000, 1000 * attempt));
             }
         }
 
-        return null;
+        throw new Error('生成未完成。');
+    };
+
+    try {
+        const results = await Promise.all(Array.from({ length: generationCount }, async (_item, imageIndex) => {
+            try {
+                return {
+                    ok: true,
+                    value: await generateOneImage(imageIndex),
+                    imageIndex,
+                };
+            } catch (error) {
+                return {
+                    ok: false,
+                    error,
+                    imageIndex,
+                };
+            }
+        }));
+
+        if (abortController.signal.aborted) {
+            throw new Error('Cancelled by user');
+        }
+
+        const successful = results
+            .filter(result => result.ok && result.value?.imagePath)
+            .sort((left, right) => left.imageIndex - right.imageIndex);
+        const failed = results.filter(result => !result.ok);
+
+        if (!successful.length) {
+            const firstError = failed[0]?.error;
+            throw firstError || new Error('生成未完成。');
+        }
+
+        const imagePaths = successful.map(result => result.value.imagePath);
+        const attempts = Math.max(...successful.map(result => Number(result.value.attempts) || 1));
+        const updatedCharacterConsistency = rememberGeneratedImageAsCharacterReference(imagePaths[0], normalizedPrompt, characterConsistency);
+
+        if (failed.length && showToasts) {
+            toastr.warning(`有 ${failed.length} 张生成失败，已展示成功的 ${imagePaths.length} 张。`, 'Dual Image API');
+        }
+
+        return {
+            prompt: imagePrompt,
+            imagePath: imagePaths[0],
+            imagePaths,
+            mode: decision.mode,
+            attempts,
+            failedImages: failed.length,
+            failures: failed.map(result => result.error?.message || String(result.error || '未知错误')),
+            characterConsistency: updatedCharacterConsistency,
+        };
     } catch (error) {
         if (abortController.signal.aborted) {
             setStatus('生成已取消。');
@@ -970,6 +1035,18 @@ function registerAutoIllustrationHooks() {
         }
     });
 
+    $(document).off('click.dualImageDelete').on('click.dualImageDelete', '.dual_image_delete_button', async function () {
+        const button = $(this);
+        const messageId = Number($(this).closest('.mes').attr('mesid'));
+        const imagePath = String(button.data('imagePath') || '');
+        button.prop('disabled', true).addClass('is-loading');
+        try {
+            await deleteGeneratedImageFromMessage(messageId, imagePath);
+        } finally {
+            button.prop('disabled', false).removeClass('is-loading');
+        }
+    });
+
     setTimeout(renderAutoImageControlsForChat, 50);
 }
 
@@ -986,36 +1063,147 @@ function renderAutoImageControls(messageId) {
         return;
     }
 
-    messageElement.find('.dual-image-retry-panel').remove();
+    messageElement.find('.dual-image-control-stack').remove();
+
+    const imagePaths = getMessageGeneratedImagePaths(message);
+    const controlPanels = [];
+    if (imagePaths.length) {
+        controlPanels.push(createGeneratedImageDeletePanel(imagePaths));
+    }
 
     const metadata = message?.extra?.dual_image_auto;
     const prompt = cleanImagePrompt(metadata?.prompt || '');
-    if (!metadata?.failed || metadata?.pending || pendingAutoIllustrations.has(numericMessageId) || !prompt) {
+    if (metadata?.failed && !metadata?.pending && !pendingAutoIllustrations.has(numericMessageId) && prompt) {
+        const panel = $('<div class="dual-image-retry-panel"></div>');
+        const errorText = truncateDisplayText(metadata.error || '配图生成失败', 80);
+        const hint = $('<span class="dual-image-retry-text"></span>').text(errorText ? `配图失败：${errorText}` : '配图生成失败');
+        const button = $('<button type="button" class="menu_button dual_image_retry_button" title="使用同一提示词重新生图"></button>');
+        button.append('<i class="fa-solid fa-rotate-right" aria-hidden="true"></i>');
+        button.append(document.createTextNode('重新生图'));
+
+        panel.append(hint, button);
+        controlPanels.push(panel);
+    }
+
+    if (!controlPanels.length) {
         return;
     }
 
-    const panel = $('<div class="dual-image-retry-panel"></div>');
-    const errorText = truncateDisplayText(metadata.error || '配图生成失败', 80);
-    const hint = $('<span class="dual-image-retry-text"></span>').text(errorText ? `配图失败：${errorText}` : '配图生成失败');
-    const button = $('<button type="button" class="menu_button dual_image_retry_button" title="使用同一提示词重新生图"></button>');
-    button.append('<i class="fa-solid fa-rotate-right" aria-hidden="true"></i>');
-    button.append(document.createTextNode('重新生图'));
-
-    panel.append(hint, button);
+    const stack = $('<div class="dual-image-control-stack"></div>');
+    for (const panel of controlPanels) {
+        stack.append(panel);
+    }
 
     const textElement = messageElement.find('.mes_text').last();
     if (textElement.length) {
-        panel.insertAfter(textElement);
+        stack.insertAfter(textElement);
         return;
     }
 
     const blockElement = messageElement.find('.mes_block').first();
     if (blockElement.length) {
-        blockElement.append(panel);
+        blockElement.append(stack);
         return;
     }
 
-    messageElement.append(panel);
+    messageElement.append(stack);
+}
+
+function createGeneratedImageDeletePanel(imagePaths) {
+    const panel = $('<div class="dual-image-delete-panel"></div>');
+    const label = $('<span class="dual-image-delete-text"></span>').text(`配图 ${imagePaths.length} 张`);
+    panel.append(label);
+
+    imagePaths.forEach((imagePath, index) => {
+        const button = $('<button type="button" class="menu_button dual_image_delete_button" title="从这条消息中删除这张配图"></button>');
+        button.data('imagePath', imagePath);
+        button.append('<i class="fa-solid fa-trash" aria-hidden="true"></i>');
+        button.append(document.createTextNode(`删除 ${index + 1}`));
+        panel.append(button);
+    });
+
+    return panel;
+}
+
+function getMessageGeneratedImagePaths(message) {
+    const extra = message?.extra || {};
+    const hasDualImageMetadata = Boolean(extra.dual_image_auto || extra.dual_image_manual);
+    const paths = [
+        ...getMetadataImagePaths(extra.dual_image_auto),
+        ...getMetadataImagePaths(extra.dual_image_manual),
+    ];
+
+    if (hasDualImageMetadata && Array.isArray(extra.media)) {
+        for (const item of extra.media) {
+            if (item?.type === MEDIA_TYPE.IMAGE && item?.url && (item.dual_image_auto || item.dual_image_mode || item.source === MEDIA_SOURCE.GENERATED)) {
+                paths.push(item.url);
+            }
+        }
+    }
+
+    return normalizeImagePathList(paths);
+}
+
+function getMetadataImagePaths(metadata) {
+    if (!metadata || typeof metadata !== 'object') {
+        return [];
+    }
+
+    return normalizeImagePathList([
+        ...(Array.isArray(metadata.image_paths) ? metadata.image_paths : []),
+        metadata.image_path,
+    ]);
+}
+
+async function deleteGeneratedImageFromMessage(messageId, imagePath) {
+    const context = getContext();
+    const message = context.chat?.[messageId];
+    const path = String(imagePath || '').trim();
+    if (!message || !path) {
+        toastr.error('找不到要删除的配图。', 'Dual Image API');
+        return;
+    }
+
+    message.extra = message.extra || {};
+    message.mes = removeGeneratedImageMarkdown(message.mes, path);
+
+    if (Array.isArray(message.extra.media)) {
+        message.extra.media = message.extra.media.filter(item => item?.url !== path);
+        if (message.extra.media.length > 0) {
+            message.extra.media_index = Math.min(Number(message.extra.media_index) || 0, message.extra.media.length - 1);
+        } else {
+            delete message.extra.media_index;
+        }
+    }
+
+    updateGeneratedImageMetadataAfterDelete(message.extra.dual_image_auto, path);
+    updateGeneratedImageMetadataAfterDelete(message.extra.dual_image_manual, path);
+
+    updateMessageBlock(messageId, message);
+    await eventSource.emit(event_types.MESSAGE_UPDATED, messageId);
+    await context.saveChat();
+    renderAutoImageControls(messageId);
+    toastr.success('已从当前消息删除这张配图。', 'Dual Image API');
+}
+
+function updateGeneratedImageMetadataAfterDelete(metadata, imagePath) {
+    if (!metadata || typeof metadata !== 'object') {
+        return;
+    }
+
+    const remaining = getMetadataImagePaths(metadata).filter(path => path !== imagePath);
+    metadata.image_paths = remaining;
+    metadata.image_path = remaining[0] || '';
+    metadata.deleted_image_paths = normalizeImagePathList([...(metadata.deleted_image_paths || []), imagePath]);
+    metadata.updated_at = new Date().toISOString();
+}
+
+function removeGeneratedImageMarkdown(text, imagePath) {
+    return removeMarkdownImageByPath(text, imagePath)
+        .replace(/<!--DUAL_IMAGE_RESULT:[\s\S]*?-->/g, '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trimEnd();
 }
 
 function renderAutoImageControlsForChat() {
@@ -1230,8 +1418,9 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
             abortActive: false,
             statusPrefix: '正在自动配图，使用',
             throwOnError: true,
-            onRetry: async ({ attempt, retryCount, error }) => {
-                const messageText = `配图生成失败，正在重试 ${attempt}/${retryCount}...`;
+            onRetry: async ({ attempt, retryCount, error, imageIndex, generationCount }) => {
+                const imageLabel = generationCount > 1 ? `第 ${imageIndex + 1}/${generationCount} 张` : '配图';
+                const messageText = `${imageLabel}生成失败，正在重试 ${attempt}/${retryCount}...`;
                 await updateAutoImagePlaceholderText(messageId, placeholderId, messageText, error);
             },
         });
@@ -1240,20 +1429,23 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
             throw new Error('生成未完成。');
         }
 
-        await replaceAutoImagePlaceholder(messageId, placeholderId, formatImageMarkdown(generated.imagePath), {
+        const imagePaths = getGeneratedResultImagePaths(generated);
+        await replaceAutoImagePlaceholder(messageId, placeholderId, formatImageMarkdownList(imagePaths), {
             done: true,
             failed: false,
             mode: generated.mode,
             prompt: generated.prompt,
             prompt_source: promptSource,
-            image_path: generated.imagePath,
+            image_path: imagePaths[0],
+            image_paths: imagePaths,
             attempts: generated.attempts || 1,
+            failed_images: generated.failedImages || 0,
             character_names: generated.characterConsistency?.characters?.map(character => character.name) || [],
             reference_images: generated.characterConsistency?.referenceImages || [],
             inserted_at: new Date().toISOString(),
         });
-        setStatus(`自动配图完成：${generated.mode.toUpperCase()}`);
-        toastr.success('已为 AI 回复插入配图。', 'Dual Image API');
+        setStatus(`自动配图完成：${generated.mode.toUpperCase()}，共 ${imagePaths.length} 张`);
+        toastr.success(`已为 AI 回复插入配图：${imagePaths.length} 张。`, 'Dual Image API');
     } catch (error) {
         const retryCount = getRetryCount();
         await replaceAutoImagePlaceholder(messageId, placeholderId, formatAutoImageFailure(error, retryCount, placeholderId), {
@@ -1302,8 +1494,9 @@ async function retryAutoImageForMessage(messageId) {
             abortActive: false,
             statusPrefix: '正在重新配图，使用',
             throwOnError: true,
-            onRetry: async ({ attempt, retryCount, error }) => {
-                const messageText = `重新配图失败，正在重试 ${attempt}/${retryCount}...`;
+            onRetry: async ({ attempt, retryCount, error, imageIndex, generationCount }) => {
+                const imageLabel = generationCount > 1 ? `第 ${imageIndex + 1}/${generationCount} 张` : '重新配图';
+                const messageText = `${imageLabel}生成失败，正在重试 ${attempt}/${retryCount}...`;
                 await updateAutoImagePlaceholderText(messageId, placeholderId, messageText, error);
             },
         });
@@ -1312,20 +1505,23 @@ async function retryAutoImageForMessage(messageId) {
             throw new Error('重新生成未完成。');
         }
 
-        await replaceAutoImagePlaceholder(messageId, placeholderId, formatImageMarkdown(generated.imagePath), {
+        const imagePaths = getGeneratedResultImagePaths(generated);
+        await replaceAutoImagePlaceholder(messageId, placeholderId, formatImageMarkdownList(imagePaths), {
             done: true,
             failed: false,
             mode: generated.mode,
             prompt: generated.prompt,
             prompt_source: promptSource,
-            image_path: generated.imagePath,
+            image_path: imagePaths[0],
+            image_paths: imagePaths,
             attempts: generated.attempts || 1,
+            failed_images: generated.failedImages || 0,
             character_names: generated.characterConsistency?.characters?.map(character => character.name) || [],
             reference_images: generated.characterConsistency?.referenceImages || [],
             retried_at: new Date().toISOString(),
         });
-        setStatus(`重新配图完成：${generated.mode.toUpperCase()}`);
-        toastr.success('已重新生成配图。', 'Dual Image API');
+        setStatus(`重新配图完成：${generated.mode.toUpperCase()}，共 ${imagePaths.length} 张`);
+        toastr.success(`已重新生成配图：${imagePaths.length} 张。`, 'Dual Image API');
     } catch (error) {
         const retryCount = getRetryCount();
         await replaceAutoImagePlaceholder(messageId, placeholderId, formatAutoImageFailure(error, retryCount, placeholderId), {
@@ -1456,6 +1652,21 @@ function formatImageMarkdown(imagePath) {
     return `![AI 配图](${encodeMarkdownUrl(imagePath)})`;
 }
 
+function formatImageMarkdownList(imagePaths) {
+    return normalizeImagePathList(imagePaths)
+        .map((imagePath, index) => `${formatImageMarkdown(imagePath)}<!--DUAL_IMAGE_RESULT:${index + 1}:${hashString(imagePath)}-->`)
+        .join('\n\n');
+}
+
+function getGeneratedResultImagePaths(generated) {
+    return normalizeImagePathList(generated?.imagePaths || generated?.imagePath);
+}
+
+function normalizeImagePathList(value) {
+    const items = Array.isArray(value) ? value : [value];
+    return [...new Set(items.map(item => String(item || '').trim()).filter(Boolean))];
+}
+
 function formatAutoImageFailure(error, retryCount, placeholderId = '') {
     const message = sanitizeInlineText(error?.message || String(error || '未知错误'));
     const body = `（配图生成失败，已重试 ${retryCount} 次：${message}）`;
@@ -1536,11 +1747,12 @@ function removePriorAutoImageResult(text, metadata = {}) {
         .replace(toGlobalRegex(AUTO_PLACEHOLDER_RE), '')
         .replace(toGlobalRegex(AUTO_FAILURE_RE), '');
 
-    if (metadata.image_path) {
-        output = removeMarkdownImageByPath(output, metadata.image_path);
+    for (const imagePath of getMetadataImagePaths(metadata)) {
+        output = removeMarkdownImageByPath(output, imagePath);
     }
 
     return output
+        .replace(/<!--DUAL_IMAGE_RESULT:[\s\S]*?-->/g, '')
         .replace(/\n?\s*（配图生成失败，已重试\s*\d+\s*次：[^\n]*）/g, '')
         .replace(/[ \t]+\n/g, '\n')
         .replace(/\n{3,}/g, '\n\n')
@@ -2343,6 +2555,11 @@ function getRetryCount(value = settings().retryCount) {
     return Number.isFinite(count) ? clamp(Math.floor(count), 0, 10) : defaultSettings.retryCount;
 }
 
+function getConcurrentGenerationCount(value = settings().concurrentGenerations) {
+    const count = Number(value);
+    return Number.isFinite(count) ? clamp(Math.floor(count), 1, 10) : defaultSettings.concurrentGenerations;
+}
+
 function clamp(value, min, max) {
     return Math.min(max, Math.max(min, value));
 }
@@ -2411,15 +2628,28 @@ function getGeneratedImageTarget() {
     return { folderName, filename };
 }
 
+function getGeneratedImageTargetForIndex(baseTarget, imageIndex, totalCount) {
+    if (totalCount <= 1) {
+        return baseTarget;
+    }
+
+    const suffix = String(imageIndex + 1).padStart(2, '0');
+    return {
+        folderName: baseTarget.folderName,
+        filename: `${baseTarget.filename}_${suffix}`,
+    };
+}
+
 async function saveGeneratedImage(base64, format, prompt, target = null) {
     const { folderName, filename } = target || getGeneratedImageTarget();
     return await saveBase64AsFile(base64, folderName, filename, format);
 }
 
-async function sendImageMessage(prompt, imagePath, mode) {
+async function sendImageMessage(prompt, imagePaths, mode) {
     const context = getContext();
     const name = context.groupId ? systemUserName : context.name2;
     const messageText = settings().showModeNote ? `[${mode.toUpperCase()}] ${prompt}` : prompt;
+    const paths = normalizeImagePathList(imagePaths);
     const message = {
         name,
         is_user: false,
@@ -2427,17 +2657,23 @@ async function sendImageMessage(prompt, imagePath, mode) {
         send_date: getMessageTimeStamp(),
         mes: messageText,
         extra: {
-            media: [{
+            media: paths.map(imagePath => ({
                 url: imagePath,
                 type: MEDIA_TYPE.IMAGE,
                 title: prompt,
                 source: MEDIA_SOURCE.GENERATED,
                 dual_image_mode: mode,
-            }],
+            })),
             media_display: MEDIA_DISPLAY.GALLERY,
             media_index: 0,
             inline_image: false,
-            dual_image_manual: true,
+            dual_image_manual: {
+                mode,
+                prompt,
+                image_path: paths[0] || '',
+                image_paths: paths,
+                inserted_at: new Date().toISOString(),
+            },
         },
     };
 
