@@ -2200,24 +2200,7 @@ function prepareImagePromptForMode(prompt, mode) {
         return simplePrompt;
     }
 
-    const scenePrompt = simplifyNaturalScenePrompt(softenSfwPromptTerms(cleanImageSceneText(simplePrompt) || simplePrompt));
-    if (!scenePrompt) {
-        return '';
-    }
-
-    const context = getContext();
-    const userName = context.name1 || '<user>';
-    const characterName = context.name2 || 'the main character';
-    const partnerRule = scenePrompt.includes(userName) || scenePrompt.includes('<user>')
-        ? `如果 ${userName} 出现在画面里，同时画出 ${characterName} 或另一个同场人物，不要只画 ${userName} 单人。`
-        : `如果场景涉及 ${userName}，画面里需要有 ${characterName} 或另一个同场人物。`;
-
-    return compactSceneText([
-        scenePrompt,
-        '画面安全、穿着完整、非情色，不出现裸露、私密部位或挑逗特写。',
-        partnerRule,
-        '不要文字、对话框、水印、界面元素或规则说明。',
-    ].filter(Boolean).join(' ')).slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+    return simplifyNaturalScenePrompt(softenSfwPromptTerms(cleanImageSceneText(simplePrompt) || simplePrompt));
 }
 
 function buildCharacterConsistencyPayload(scenePrompt, mode) {
@@ -2272,9 +2255,7 @@ function applyCharacterConsistencyToPrompt(basePrompt, payload, mode) {
         return `参考人物: ${appearance}`;
     });
 
-    const identityRule = mode === 'sfw'
-        ? '保持同一人物的脸型、发型、眼睛、体型、服装识别点和整体气质一致，画面保持安全非情色。'
-        : '保持同一人物的身份、脸型、发型、体型、服装识别点和整体气质一致。';
+    const identityRule = '保持同一人物的脸型、发型、体型、服装识别点和整体气质一致。';
 
     return compactSceneText([
         prompt,
@@ -2413,12 +2394,12 @@ function cleanImageSceneText(value) {
 
 function softenSfwPromptTerms(value) {
     return String(value || '')
-        .replace(/\b(nude|naked|topless|bottomless|explicit|pornographic|porn|erotic|sexual|sex)\b/gi, 'non-explicit')
-        .replace(/\b(lingerie|underwear|panties|bra)\b/gi, 'modest outfit')
-        .replace(/\b(seductive|aroused|orgasm|genitals|breasts?|nipples?)\b/gi, 'dramatic')
-        .replace(/\b(ntr|cuckold|affair|cheating|fetish)\b/gi, 'subtle dramatic tension')
-        .replace(/未成年|高中生|高二|高一|高三|学生|萝莉|正太/gi, 'young adult')
-        .replace(/裸露|裸体|色情|情色|性爱|性交|性器|乳头|胸部特写|胸部|内衣|内裤|没穿内裤|私密|性感|勾引|背德|偷情|刺激|调情|丝袜/gi, '安全得体')
+        .replace(/\b(nude|naked|topless|bottomless|explicit|pornographic|porn|erotic|sexual|sex)\b/gi, '穿着得体')
+        .replace(/\b(lingerie|underwear|panties|bra)\b/gi, '日常服装')
+        .replace(/\b(seductive|aroused|orgasm|genitals|breasts?|nipples?)\b/gi, '自然神态')
+        .replace(/\b(ntr|cuckold|affair|cheating|fetish)\b/gi, '微妙紧张氛围')
+        .replace(/未成年|高中生|高二|高一|高三|学生|萝莉|正太/gi, '年轻成人')
+        .replace(/裸露|裸体|色情|情色|性爱|性交|性器|乳头|胸部特写|胸部|内衣|内裤|没穿内裤|私密|性感|勾引|背德|偷情|刺激|调情|丝袜/gi, '日常得体')
         .trim();
 }
 
