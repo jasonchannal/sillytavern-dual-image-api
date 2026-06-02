@@ -7,6 +7,7 @@ import {
 } from '/scripts/constants.js';
 import {
     appendMediaToMessage,
+    chat_metadata,
     event_types,
     eventSource,
     extension_prompt_roles,
@@ -21,6 +22,7 @@ import {
     extension_settings,
     getContext,
     renderExtensionTemplateAsync,
+    saveMetadataDebounced,
 } from '/scripts/extensions.js';
 import { getMessageTimeStamp } from '/scripts/RossAscends-mods.js';
 import { saveBase64AsFile } from '/scripts/utils.js';
@@ -39,6 +41,7 @@ const modulePath = new URL('.', import.meta.url).pathname;
 const moduleFolder = modulePath.split('/').filter(Boolean).pop() || 'dual-image-api';
 const MODULE_NAME = modulePath.includes('/third-party/') ? `third-party/${moduleFolder}` : moduleFolder;
 const SETTINGS_KEY = 'dualImageApi';
+const CHAT_METADATA_KEY = 'dualImageApiCharacterConsistency';
 const API_BASE = '/api/plugins/dual-image-api';
 const AUTO_SKIP_TOKEN = 'SKIP';
 const AUTO_PROMPT_INJECTION_KEY = 'dual-image-api-auto-inline-prompt';
@@ -164,6 +167,11 @@ const defaultSettings = {
         fallbackToMessage: true,
         instructionTemplate: defaultAutoInstructionTemplate,
     },
+    characterConsistency: {
+        enabledByDefault: true,
+        useReferenceImagesByDefault: true,
+        referenceWeight: 0.75,
+    },
 };
 
 export async function init() {
@@ -269,6 +277,7 @@ function bindSettings() {
     });
 
     bindAutoSettings(current);
+    bindCharacterConsistencySettings();
 
     for (const mode of ['sfw', 'nsfw']) {
         loadProfileInputs(mode);
@@ -348,6 +357,229 @@ function bindAutoSettings(current) {
         saveSettingsDebounced();
         toastr.success('自动配图注入要求已恢复默认。', 'Dual Image API');
     });
+}
+
+function bindCharacterConsistencySettings() {
+    renderCharacterConsistencySettings();
+
+    $('#dual_image_character_consistency_enabled').on('input', () => {
+        const state = getCharacterConsistencyState();
+        state.enabled = $('#dual_image_character_consistency_enabled').prop('checked');
+        saveCharacterConsistencyState(state);
+    });
+
+    $('#dual_image_character_use_references').on('input', () => {
+        const state = getCharacterConsistencyState();
+        state.useReferenceImages = $('#dual_image_character_use_references').prop('checked');
+        saveCharacterConsistencyState(state);
+    });
+
+    $('#dual_image_character_select').on('change', () => {
+        const state = getCharacterConsistencyState();
+        state.selectedName = String($('#dual_image_character_select').val() || getDefaultCharacterName());
+        ensureCharacterProfile(state, state.selectedName);
+        saveCharacterConsistencyState(state);
+        renderCharacterConsistencySettings();
+    });
+
+    $('#dual_image_character_add_current').on('click', () => {
+        const state = getCharacterConsistencyState();
+        const name = getDefaultCharacterName();
+        state.selectedName = name;
+        ensureCharacterProfile(state, name);
+        saveCharacterConsistencyState(state);
+        renderCharacterConsistencySettings();
+        toastr.success('已添加当前角色档案。', 'Dual Image API');
+    });
+
+    $('#dual_image_character_save').on('click', () => {
+        saveCharacterProfileFromInputs();
+        toastr.success('角色一致性档案已保存到当前聊天。', 'Dual Image API');
+    });
+
+    $('#dual_image_character_delete').on('click', () => {
+        const state = getCharacterConsistencyState();
+        const name = String($('#dual_image_character_select').val() || '');
+        if (!name || !state.characters[name]) {
+            return;
+        }
+
+        delete state.characters[name];
+        state.selectedName = getDefaultCharacterName();
+        saveCharacterConsistencyState(state);
+        renderCharacterConsistencySettings();
+        toastr.success('已删除当前角色档案。', 'Dual Image API');
+    });
+
+    $('#dual_image_character_use_latest').on('click', () => {
+        const latestImage = findLatestGeneratedImagePath();
+        if (!latestImage) {
+            toastr.warning('当前聊天里还没有可用的生成图片。', 'Dual Image API');
+            return;
+        }
+
+        $('#dual_image_character_reference').val(latestImage);
+        saveCharacterProfileFromInputs();
+        toastr.success('已把最近生成图设为参考图。', 'Dual Image API');
+    });
+}
+
+function renderCharacterConsistencySettings() {
+    const container = $('#dual_image_character_consistency_enabled');
+    if (!container.length) {
+        return;
+    }
+
+    const state = getCharacterConsistencyState();
+    const names = getKnownCharacterNames(state);
+    if (!state.selectedName || !names.includes(state.selectedName)) {
+        state.selectedName = names[0] || getDefaultCharacterName();
+    }
+    ensureCharacterProfile(state, state.selectedName);
+
+    $('#dual_image_character_consistency_enabled').prop('checked', state.enabled);
+    $('#dual_image_character_use_references').prop('checked', state.useReferenceImages);
+
+    const select = $('#dual_image_character_select');
+    select.empty();
+    for (const name of names) {
+        select.append($('<option></option>').val(name).text(name));
+    }
+    select.val(state.selectedName);
+
+    const profile = state.characters[state.selectedName] || {};
+    $('#dual_image_character_profile_enabled').prop('checked', profile.enabled !== false);
+    $('#dual_image_character_aliases').val(profile.aliases || '');
+    $('#dual_image_character_visual_prompt').val(profile.visualPrompt || '');
+    $('#dual_image_character_reference').val(profile.referenceImage || '');
+    $('#dual_image_character_reference_weight').val(Number(profile.referenceWeight ?? state.referenceWeight ?? defaultSettings.characterConsistency.referenceWeight));
+}
+
+function saveCharacterProfileFromInputs() {
+    const state = getCharacterConsistencyState();
+    const name = String($('#dual_image_character_select').val() || getDefaultCharacterName()).trim();
+    if (!name) {
+        return;
+    }
+
+    const profile = ensureCharacterProfile(state, name);
+    profile.enabled = $('#dual_image_character_profile_enabled').prop('checked');
+    profile.aliases = String($('#dual_image_character_aliases').val() || '').trim();
+    profile.visualPrompt = String($('#dual_image_character_visual_prompt').val() || '').trim();
+    profile.referenceImage = String($('#dual_image_character_reference').val() || '').trim();
+    profile.referenceWeight = clamp(Number($('#dual_image_character_reference_weight').val()) || defaultSettings.characterConsistency.referenceWeight, 0, 2);
+    profile.updatedAt = new Date().toISOString();
+    state.selectedName = name;
+    state.referenceWeight = profile.referenceWeight;
+    saveCharacterConsistencyState(state);
+    renderCharacterConsistencySettings();
+}
+
+function getCharacterConsistencyState() {
+    const existing = chat_metadata[CHAT_METADATA_KEY] || {};
+    const state = {
+        enabled: existing.enabled ?? settings().characterConsistency.enabledByDefault,
+        useReferenceImages: existing.useReferenceImages ?? settings().characterConsistency.useReferenceImagesByDefault,
+        referenceWeight: Number(existing.referenceWeight ?? settings().characterConsistency.referenceWeight) || defaultSettings.characterConsistency.referenceWeight,
+        selectedName: String(existing.selectedName || getDefaultCharacterName()),
+        characters: existing.characters && typeof existing.characters === 'object' ? { ...existing.characters } : {},
+    };
+
+    for (const [name, profile] of Object.entries(state.characters)) {
+        state.characters[name] = normalizeCharacterProfile(name, profile);
+    }
+
+    return state;
+}
+
+function saveCharacterConsistencyState(state) {
+    chat_metadata[CHAT_METADATA_KEY] = {
+        enabled: state.enabled !== false,
+        useReferenceImages: state.useReferenceImages !== false,
+        referenceWeight: Number(state.referenceWeight) || defaultSettings.characterConsistency.referenceWeight,
+        selectedName: String(state.selectedName || getDefaultCharacterName()),
+        characters: state.characters || {},
+    };
+    saveMetadataDebounced();
+}
+
+function ensureCharacterProfile(state, name) {
+    const profileName = String(name || getDefaultCharacterName()).trim();
+    if (!profileName) {
+        return null;
+    }
+
+    state.characters = state.characters || {};
+    state.characters[profileName] = normalizeCharacterProfile(profileName, state.characters[profileName]);
+    return state.characters[profileName];
+}
+
+function normalizeCharacterProfile(name, profile = {}) {
+    return {
+        name: String(profile.name || name || '').trim(),
+        enabled: profile.enabled !== false,
+        aliases: String(profile.aliases || '').trim(),
+        visualPrompt: String(profile.visualPrompt || '').trim(),
+        referenceImage: String(profile.referenceImage || '').trim(),
+        referenceWeight: clamp(Number(profile.referenceWeight) || defaultSettings.characterConsistency.referenceWeight, 0, 2),
+        updatedAt: profile.updatedAt || '',
+    };
+}
+
+function getKnownCharacterNames(state = getCharacterConsistencyState()) {
+    const context = getContext();
+    const names = new Set();
+    const addName = (name) => {
+        const value = String(name || '').trim();
+        if (value) {
+            names.add(value);
+        }
+    };
+
+    addName(context.name2);
+    addName(context.name1);
+
+    if (Array.isArray(context.chat)) {
+        for (const message of context.chat.slice(-80)) {
+            if (!message?.is_system) {
+                addName(message?.name);
+            }
+        }
+    }
+
+    for (const name of Object.keys(state.characters || {})) {
+        addName(name);
+    }
+
+    return [...names];
+}
+
+function getDefaultCharacterName() {
+    const context = getContext();
+    return String(context.name2 || context.name1 || 'Character').trim();
+}
+
+function findLatestGeneratedImagePath() {
+    const context = getContext();
+    if (!Array.isArray(context.chat)) {
+        return '';
+    }
+
+    for (let index = context.chat.length - 1; index >= 0; index--) {
+        const message = context.chat[index];
+        const autoPath = message?.extra?.dual_image_auto?.image_path;
+        if (autoPath) {
+            return autoPath;
+        }
+
+        const media = Array.isArray(message?.extra?.media) ? message.extra.media : [];
+        const image = [...media].reverse().find(item => item?.type === MEDIA_TYPE.IMAGE && item?.url);
+        if (image?.url) {
+            return image.url;
+        }
+    }
+
+    return '';
 }
 
 function loadProfileInputs(mode) {
@@ -497,7 +729,9 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
     }
 
     const profile = settings().profiles[decision.mode];
-    const imagePrompt = prepareImagePromptForMode(normalizedPrompt, decision.mode);
+    const baseImagePrompt = prepareImagePromptForMode(normalizedPrompt, decision.mode);
+    const characterConsistency = buildCharacterConsistencyPayload(normalizedPrompt, decision.mode);
+    const imagePrompt = applyCharacterConsistencyToPrompt(baseImagePrompt, characterConsistency, decision.mode);
     if (!imagePrompt) {
         const error = new Error('提示词里没有可绘制的可见场景。');
         setStatus(error.message);
@@ -532,6 +766,7 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                         saveFolder: imageTarget.folderName,
                         saveFilename: imageTarget.filename,
                         imageOutput,
+                        referenceImages: characterConsistency.referenceImages,
                     },
                 });
 
@@ -540,7 +775,7 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                 }
 
                 const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', normalizedPrompt, imageTarget);
-                return { prompt: imagePrompt, imagePath, mode: decision.mode, attempts: attempt };
+                return { prompt: imagePrompt, imagePath, mode: decision.mode, attempts: attempt, characterConsistency };
             } catch (error) {
                 if (abortController.signal.aborted || attempt >= maxAttempts) {
                     throw error;
@@ -612,6 +847,7 @@ function registerAutoIllustrationHooks() {
         pendingAutoIllustrations.clear();
         clearAutoPromptInjection();
         setTimeout(renderAutoImageControlsForChat, 50);
+        setTimeout(renderCharacterConsistencySettings, 50);
     });
 
     $(document).off('click.dualImageRetry').on('click.dualImageRetry', '.dual_image_retry_button', async function () {
@@ -903,6 +1139,8 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
             prompt_source: promptSource,
             image_path: generated.imagePath,
             attempts: generated.attempts || 1,
+            character_names: generated.characterConsistency?.characters?.map(character => character.name) || [],
+            reference_images: generated.characterConsistency?.referenceImages || [],
             inserted_at: new Date().toISOString(),
         });
         setStatus(`自动配图完成：${generated.mode.toUpperCase()}`);
@@ -973,6 +1211,8 @@ async function retryAutoImageForMessage(messageId) {
             prompt_source: promptSource,
             image_path: generated.imagePath,
             attempts: generated.attempts || 1,
+            character_names: generated.characterConsistency?.characters?.map(character => character.name) || [],
+            reference_images: generated.characterConsistency?.referenceImages || [],
             retried_at: new Date().toISOString(),
         });
         setStatus(`重新配图完成：${generated.mode.toUpperCase()}`);
@@ -1569,6 +1809,101 @@ function prepareImagePromptForMode(prompt, mode) {
         'visible subjects, clear action, setting, mood, clothing, lighting, camera framing',
         'no dialogue, no captions, no UI text, no watermark, no lore notes, no rule text, no analysis',
     ].filter(Boolean).join(', ');
+}
+
+function buildCharacterConsistencyPayload(scenePrompt, mode) {
+    const state = getCharacterConsistencyState();
+    if (!state.enabled) {
+        return { characters: [], referenceImages: [] };
+    }
+
+    const profiles = getMatchedCharacterProfiles(scenePrompt, state);
+    const characters = profiles.map(profile => {
+        const visualPrompt = mode === 'sfw'
+            ? softenSfwPromptTerms(cleanImageSceneText(profile.visualPrompt) || profile.visualPrompt)
+            : cleanImagePrompt(profile.visualPrompt) || String(profile.visualPrompt || '').trim();
+        return {
+            name: profile.name,
+            visualPrompt,
+            referenceImage: String(profile.referenceImage || '').trim(),
+            referenceWeight: clamp(Number(profile.referenceWeight) || state.referenceWeight || defaultSettings.characterConsistency.referenceWeight, 0, 2),
+        };
+    }).filter(profile => profile.visualPrompt || profile.referenceImage);
+
+    const referenceImages = state.useReferenceImages
+        ? characters
+            .filter(profile => profile.referenceImage)
+            .map(profile => ({
+                name: profile.name,
+                url: profile.referenceImage,
+                weight: profile.referenceWeight,
+            }))
+        : [];
+
+    return { characters, referenceImages };
+}
+
+function applyCharacterConsistencyToPrompt(basePrompt, payload, mode) {
+    const prompt = String(basePrompt || '').trim();
+    if (!prompt || !payload?.characters?.length) {
+        return prompt;
+    }
+
+    const characterPrompts = payload.characters.map(character => {
+        const parts = [
+            character.name,
+            character.visualPrompt,
+            character.referenceImage ? 'match the provided reference image identity' : '',
+        ].filter(Boolean);
+        return parts.join(': ');
+    });
+
+    const identityRule = mode === 'sfw'
+        ? 'keep the same face, hairstyle, eye color, body type, outfit identity, and recognizable details across images'
+        : 'keep the same character identity, face, hairstyle, body type, outfit identity, and recognizable details across images';
+
+    return [
+        prompt,
+        `Character consistency: ${characterPrompts.join('; ')}`,
+        identityRule,
+    ].filter(Boolean).join(', ');
+}
+
+function getMatchedCharacterProfiles(scenePrompt, state = getCharacterConsistencyState()) {
+    const text = normalizePrompt(scenePrompt);
+    const profiles = Object.values(state.characters || {})
+        .map(profile => normalizeCharacterProfile(profile.name, profile))
+        .filter(profile => profile.enabled !== false && (profile.visualPrompt || profile.referenceImage));
+    const matched = profiles.filter(profile => characterProfileMatchesPrompt(profile, text));
+
+    if (matched.length > 0) {
+        return matched;
+    }
+
+    const defaultName = getDefaultCharacterName();
+    const defaultProfile = profiles.find(profile => profile.name === defaultName);
+    if (defaultProfile && looksLikeHumanScene(scenePrompt)) {
+        return [defaultProfile];
+    }
+
+    return [];
+}
+
+function characterProfileMatchesPrompt(profile, normalizedPrompt) {
+    const names = [profile.name, ...splitCharacterAliases(profile.aliases)].map(normalizePrompt).filter(Boolean);
+    return names.some(name => normalizedPrompt.includes(name));
+}
+
+function splitCharacterAliases(value) {
+    return String(value || '')
+        .split(/[,，;；、\n]/)
+        .map(alias => alias.trim())
+        .filter(Boolean);
+}
+
+function looksLikeHumanScene(value) {
+    const text = String(value || '').toLowerCase();
+    return /人|男|女|她|他|少年|少女|角色|脸|头发|眼睛|衣|手|站|坐|躺|走|抱|person|people|man|woman|girl|boy|face|hair|eyes|wearing|standing|sitting/.test(text);
 }
 
 function cleanImageSceneText(value) {

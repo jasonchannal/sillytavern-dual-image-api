@@ -22,13 +22,15 @@
     margin-top: 10px;
 }
 
-.dual-image-auto {
+.dual-image-auto,
+.dual-image-character {
     border-top: 1px solid var(--SmartThemeBorderColor);
     padding-top: 10px;
     margin-top: 10px;
 }
 
-.dual-image-auto h4 {
+.dual-image-auto h4,
+.dual-image-character h4 {
     margin: 0 0 8px;
 }
 
@@ -51,6 +53,17 @@
 .dual-image-settings .checkbox_label {
     display: flex;
     flex-direction: row;
+}
+
+.dual-image-settings .dual-image-inline-checkbox {
+    margin-top: 8px;
+}
+
+.dual-image-hint {
+    margin-top: 6px;
+    font-size: 0.9em;
+    opacity: 0.8;
+    overflow-wrap: anywhere;
 }
 
 .dual-image-key-row input {

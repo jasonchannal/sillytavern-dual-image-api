@@ -97,6 +97,52 @@
                 </div>
             </div>
 
+            <div class="dual-image-character">
+                <h4>角色一致性</h4>
+                <div class="dual-image-toolbar">
+                    <label for="dual_image_character_consistency_enabled" class="checkbox_label">
+                        <input id="dual_image_character_consistency_enabled" type="checkbox">
+                        <span>当前聊天启用角色一致性</span>
+                    </label>
+                    <label for="dual_image_character_use_references" class="checkbox_label">
+                        <input id="dual_image_character_use_references" type="checkbox">
+                        <span>向生图 API 发送参考图</span>
+                    </label>
+                </div>
+                <div class="dual-image-grid">
+                    <label>角色<select id="dual_image_character_select" class="text_pole"></select></label>
+                    <label>别名<input id="dual_image_character_aliases" class="text_pole" placeholder="多个别名用逗号分隔"></label>
+                    <label>参考图权重<input id="dual_image_character_reference_weight" class="text_pole" type="number" min="0" max="2" step="0.05"></label>
+                </div>
+                <label for="dual_image_character_profile_enabled" class="checkbox_label dual-image-inline-checkbox">
+                    <input id="dual_image_character_profile_enabled" type="checkbox">
+                    <span>启用这个角色档案</span>
+                </label>
+                <label>固定外观<textarea id="dual_image_character_visual_prompt" class="text_pole" rows="4" placeholder="例如：black shoulder-length hair, warm brown eyes, slim build, white shirt, navy skirt, gentle expression"></textarea></label>
+                <label>参考图路径或 URL<input id="dual_image_character_reference" class="text_pole" placeholder="user/images/角色/xxx.jpg 或 https://..."></label>
+                <div class="dual-image-actions">
+                    <div id="dual_image_character_save" class="menu_button menu_button_icon">
+                        <i class="fa-solid fa-floppy-disk"></i>
+                        <span>保存角色档案</span>
+                    </div>
+                    <div id="dual_image_character_use_latest" class="menu_button menu_button_icon">
+                        <i class="fa-solid fa-image"></i>
+                        <span>最近生成图设为参考图</span>
+                    </div>
+                    <div id="dual_image_character_add_current" class="menu_button menu_button_icon">
+                        <i class="fa-solid fa-user-plus"></i>
+                        <span>添加当前角色</span>
+                    </div>
+                    <div id="dual_image_character_delete" class="menu_button menu_button_icon">
+                        <i class="fa-solid fa-trash"></i>
+                        <span>删除档案</span>
+                    </div>
+                </div>
+                <div class="dual-image-hint">
+                    Generic JSON 可用变量：{{referenceImage}}、{{referenceImageBase64}}、{{referenceImageDataUrl}}、{{referenceImageWeight}}、{{{referenceImagesJson}}}
+                </div>
+            </div>
+
             <div class="dual-image-profile" data-profile-panel="sfw">
                 <h4>SFW API</h4>
                 <div class="dual-image-key-row">

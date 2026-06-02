@@ -19,10 +19,17 @@ const mimeExtensions = {
     'image/webp': 'webp',
     'image/gif': 'gif',
 };
+const extensionMimeTypes = {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    webp: 'image/webp',
+    gif: 'image/gif',
+};
 
 export async function init(router) {
     router.get('/health', (_request, response) => {
-        response.send({ ok: true, plugin: info.id, version: '0.2.8' });
+        response.send({ ok: true, plugin: info.id, version: '0.2.9' });
     });
 
     router.get('/secrets/status', (request, response) => {
@@ -112,7 +119,7 @@ export async function init(router) {
             }
 
             const result = profile.apiType === 'generic-json'
-                ? await generateGenericJson(prompt, profile, apiKey)
+                ? await generateGenericJson(prompt, profile, apiKey, await prepareReferenceImages(request, request.body?.referenceImages))
                 : await generateOpenAiCompatible(prompt, profile, apiKey);
 
             if (request.body?.saveToUserImages) {
@@ -170,6 +177,88 @@ function writeSecrets(request, secrets) {
     const tmpPath = `${filePath}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(secrets, null, 2), 'utf8');
     fs.renameSync(tmpPath, filePath);
+}
+
+async function prepareReferenceImages(request, value) {
+    const items = Array.isArray(value) ? value : [];
+    const output = [];
+
+    for (const item of items.slice(0, 4)) {
+        const prepared = await prepareReferenceImage(request, item);
+        if (prepared) {
+            output.push(prepared);
+        }
+    }
+
+    return output;
+}
+
+async function prepareReferenceImage(request, item = {}) {
+    const url = String(item.url || item.path || '').trim();
+    if (!url) {
+        return null;
+    }
+
+    const weight = Number.isFinite(Number(item.weight)) ? Number(item.weight) : undefined;
+    const name = String(item.name || '').trim();
+    let image;
+
+    if (/^https?:\/\//i.test(url)) {
+        image = await downloadImage(url);
+    } else if (/^data:image\//i.test(url)) {
+        image = await normalizeImageValue(url);
+    } else {
+        image = await readLocalReferenceImage(request, url);
+    }
+
+    if (!image?.data) {
+        return null;
+    }
+
+    const format = normalizeImageFormat(image.format);
+    const mimeType = extensionMimeTypes[format] || 'image/png';
+
+    return {
+        name,
+        url,
+        weight,
+        base64: image.data,
+        dataUrl: `data:${mimeType};base64,${image.data}`,
+        format,
+        mimeType,
+    };
+}
+
+async function readLocalReferenceImage(request, clientPath) {
+    const rootDirectory = request.user?.directories?.root;
+    const userImagesDirectory = request.user?.directories?.userImages;
+    if (!rootDirectory || !userImagesDirectory) {
+        throw new Error('SillyTavern user image directory is unavailable.');
+    }
+
+    const normalizedPath = safeDecodeURIComponent(String(clientPath || ''))
+        .replace(/^\/+/, '')
+        .replace(/^user\/images\//i, 'user/images/');
+    const targetPath = path.resolve(rootDirectory, normalizedPath);
+
+    if (!isPathUnderDirectory(userImagesDirectory, targetPath)) {
+        throw new Error('Reference image must be under user/images.');
+    }
+
+    const buffer = await fs.promises.readFile(targetPath);
+    const format = normalizeImageFormat(path.extname(targetPath).slice(1));
+    return {
+        data: buffer.toString('base64'),
+        format,
+    };
+}
+
+function safeDecodeURIComponent(value) {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
 }
 
 async function saveResultToUserImages(request, result, options = {}) {
@@ -384,12 +473,13 @@ async function generateOpenAiCompatible(prompt, profile, apiKey) {
     return await extractImageResult(data, profile.resultPath);
 }
 
-async function generateGenericJson(prompt, profile, apiKey) {
+async function generateGenericJson(prompt, profile, apiKey, referenceImages = []) {
     const finalPrompt = buildPrompt(prompt, profile);
     const url = buildUrl(profile.baseUrl, profile.endpoint || '');
     const headers = parseHeaders(profile.headersJson);
     const keyHeader = String(profile.apiKeyHeader || 'Authorization').trim();
     const keyPrefix = String(profile.apiKeyPrefix ?? 'Bearer ');
+    const firstReference = referenceImages[0] || {};
 
     if (keyHeader) {
         headers[keyHeader] = `${keyPrefix}${apiKey}`;
@@ -408,6 +498,20 @@ async function generateGenericJson(prompt, profile, apiKey) {
         height: String(Number(profile.height) || 1024),
         steps: String(Number(profile.steps) || 30),
         cfg: String(Number(profile.cfgScale) || 7),
+        referenceImage: firstReference.url || '',
+        referenceImageName: firstReference.name || '',
+        referenceImageWeight: firstReference.weight === undefined ? '' : String(firstReference.weight),
+        referenceImageBase64: firstReference.base64 || '',
+        referenceImageDataUrl: firstReference.dataUrl || '',
+        referenceImagesJson: JSON.stringify(referenceImages.map(image => ({
+            name: image.name || '',
+            image: image.base64 || '',
+            data_url: image.dataUrl || '',
+            url: image.url || '',
+            weight: image.weight ?? '',
+        }))),
+        referenceImageBase64List: JSON.stringify(referenceImages.map(image => image.base64 || '')),
+        referenceImageDataUrlList: JSON.stringify(referenceImages.map(image => image.dataUrl || '')),
     });
 
     const data = await requestJson(url, {
@@ -570,7 +674,9 @@ function parseHeaders(value) {
 }
 
 function renderTemplate(template, variables) {
-    return template.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, key) => {
+    return template.replace(/\{\{\{\s*([a-zA-Z0-9_]+)\s*\}\}\}/g, (_match, key) => {
+        return String(variables[key] ?? '');
+    }).replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, key) => {
         return escapeTemplateValue(variables[key] ?? '');
     });
 }
