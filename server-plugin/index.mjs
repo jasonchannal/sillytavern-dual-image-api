@@ -714,6 +714,11 @@ function toPublicError(error) {
         return 'Image API request timed out.';
     }
 
+    if (error?.message === 'fetch failed' && error?.cause) {
+        const cause = redactSecretLikeText(error.cause?.message || error.cause?.code || String(error.cause));
+        return `Image API connection failed: ${cause}`;
+    }
+
     const message = redactSecretLikeText(error?.message || String(error));
     return message.length > 600 ? `${message.slice(0, 600)}...` : message;
 }
