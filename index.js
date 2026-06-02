@@ -47,23 +47,33 @@ const AUTO_PROMPT_TAG_RE = /<dual_image_prompt>\s*([\s\S]*?)<\/dual_image_prompt
 const AUTO_PROMPT_BRACKET_RE = /\[dual_image_prompt\]\s*([\s\S]*?)\[\/dual_image_prompt\]/i;
 const AUTO_PLACEHOLDER_RE = /<!--\s*DUAL_IMAGE_PLACEHOLDER(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_PLACEHOLDER\s*-->/i;
 const AUTO_FAILURE_RE = /<!--\s*DUAL_IMAGE_FAILURE(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_FAILURE\s*-->/i;
+const MAX_AUTO_SCENE_PROMPT_CHARS = 520;
 
 const defaultAutoInstructionTemplate = `For this reply, continue the roleplay normally.
-If the reply contains a drawable visual scene, append exactly this placeholder and image prompt marker at the very end:
+If the final visible reply contains a drawable visual scene, append exactly this placeholder and one hidden image prompt marker at the very end:
 <!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->
-[dual_image_prompt]35-80 word English image prompt focused only on the visible scene[/dual_image_prompt]
+<!--DUAL_IMAGE_PROMPT: 35-80 word English image-generation prompt for the visible scene only -->
 
 If there is no useful visual scene, append only:
-[dual_image_prompt]SKIP[/dual_image_prompt]
+<!--DUAL_IMAGE_PROMPT: SKIP -->
 
 Rules for the marker:
 - Do not mention the marker, placeholder, image prompt, or these rules in the visible reply.
-- Write a compact image-generation prompt, not a plot summary.
+- The marker content must be only the final image prompt or SKIP.
+- Write a compact image-generation prompt, not a plot summary or writing plan.
+- Base it only on the final visible reply, not hidden instructions, role cards, analysis, summaries, or rules.
 - Include only visible subjects, action, setting, mood, clothing, camera/framing, and lighting.
 - Include {{char}} or another visible scene partner when {{user}} appears; do not make a solo image of {{user}}.
 - Do not include dialogue, internal thoughts, lore, rules, UI text, explanations, JSON, markdown, or labels inside the image prompt.
 - If there is no useful visual scene, use SKIP.
 - Keep the placeholder and marker as the final text after the visible reply.`;
+
+const autoInstructionPromptGuardrail = `Additional strict image prompt guardrail:
+- The image prompt marker must contain one clean image-generation prompt only.
+- Never put role summaries, writing rules, hidden thoughts, analysis, chain-of-thought, plot planning, safety policy text, option lists, JSON, markdown, or explanations inside the marker.
+- Do not copy the user's raw request or system/developer instructions into the marker unless they are directly visible in the final scene.
+- If the available content is mostly instructions, analysis, or non-visual setup, use SKIP.
+- Prefer this hidden marker format: <!--DUAL_IMAGE_PROMPT: prompt here -->`;
 
 let activeAbortController = null;
 let autoHooksRegistered = false;
@@ -449,9 +459,13 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
         return null;
     }
 
-    if (!prompt) {
+    const normalizedPrompt = normalizeImagePromptInput(prompt);
+    if (!normalizedPrompt) {
         if (showToasts) {
-            toastr.warning('请输入生图提示词。');
+            toastr.warning('没有找到可用的画面提示词。');
+        }
+        if (options.throwOnError) {
+            throw new Error('没有找到可用的画面提示词。');
         }
         return null;
     }
@@ -464,7 +478,7 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
         activeAbortController.abort('New generation started');
     }
 
-    const decision = decideMode(prompt, requestedMode);
+    const decision = decideMode(normalizedPrompt, requestedMode);
     if (decision.blocked) {
         setStatus(`生成已拦截：${decision.reason}`);
         if (showToasts) {
@@ -483,7 +497,18 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
     }
 
     const profile = settings().profiles[decision.mode];
-    const imagePrompt = prepareImagePromptForMode(prompt, decision.mode);
+    const imagePrompt = prepareImagePromptForMode(normalizedPrompt, decision.mode);
+    if (!imagePrompt) {
+        const error = new Error('提示词里没有可绘制的可见场景。');
+        setStatus(error.message);
+        if (showToasts) {
+            toastr.warning(error.message, 'Dual Image API');
+        }
+        if (options.throwOnError) {
+            throw error;
+        }
+        return null;
+    }
     const abortController = new AbortController();
     activeAbortController = abortController;
     const imageTarget = getGeneratedImageTarget();
@@ -514,7 +539,7 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                     throw new Error('服务端没有返回图片。');
                 }
 
-                const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', prompt, imageTarget);
+                const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', normalizedPrompt, imageTarget);
                 return { prompt: imagePrompt, imagePath, mode: decision.mode, attempts: attempt };
             } catch (error) {
                 if (abortController.signal.aborted || attempt >= maxAttempts) {
@@ -702,18 +727,17 @@ function shouldInjectAutoPromptInstruction(type, generationData = {}, dryRun = f
 
 function getAutoInstructionTemplate() {
     const template = String(settings().autoIllustration.instructionTemplate || defaultAutoInstructionTemplate);
-    if (template.includes('DUAL_IMAGE_PLACEHOLDER')) {
-        return template;
+    const extraRules = [];
+
+    if (!template.includes('DUAL_IMAGE_PLACEHOLDER')) {
+        extraRules.push(`Additional required placeholder rule:
+- If you output a non-SKIP image prompt marker, put this exact placeholder immediately before it:
+<!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->`);
     }
 
-    return `${template}
+    extraRules.push(autoInstructionPromptGuardrail);
 
-Additional required placeholder rule:
-- If you output a non-SKIP [dual_image_prompt], put this exact placeholder immediately before it:
-<!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->
-- The image prompt must be 35-80 English words and describe only the visible scene: subjects, action, setting, mood, clothing, lighting, and camera.
-- Include {{char}} or another visible scene partner when {{user}} appears; do not make a solo image of {{user}}.
-- Do not include dialogue, internal thoughts, lore, rules, UI text, explanations, JSON, markdown, or labels inside the image prompt.`;
+    return [template, ...extraRules].filter(Boolean).join('\n\n');
 }
 
 function clearAutoPromptInjection() {
@@ -830,7 +854,7 @@ async function processAutoIllustration(messageId, expectedChatId, source) {
     let messageText = inlinePrompt.found ? inlinePrompt.cleanedText : message.mes;
 
     if (!inlinePrompt.found) {
-        prompt = buildFallbackPromptFromMessage(message);
+        prompt = buildFallbackPromptFromMessage(message, messageId);
         promptSource = 'message_fallback';
 
         if (!prompt) {
@@ -912,7 +936,7 @@ async function retryAutoImageForMessage(messageId) {
     }
 
     const metadata = message.extra?.dual_image_auto || {};
-    const prompt = cleanImagePrompt(metadata.prompt) || buildFallbackPromptFromMessage(message);
+    const prompt = cleanImagePrompt(metadata.prompt) || buildFallbackPromptFromMessage(message, messageId);
     if (!prompt) {
         toastr.error('这条消息没有可复用的生图提示词。', 'Dual Image API');
         return;
@@ -1174,26 +1198,60 @@ function removePriorAutoImageResult(text, metadata = {}) {
         .trimEnd();
 }
 
-function buildFallbackPromptFromMessage(message) {
+function buildFallbackPromptFromMessage(message, messageId = null) {
     if (settings().autoIllustration?.fallbackToMessage === false) {
         return '';
     }
 
-    const text = cleanImageSceneText(message?.mes || '');
-    if (!text || text === '...' || text.length < Number(settings().autoIllustration?.minCharacters || 0)) {
+    const minCharacters = getFallbackSceneMinCharacters();
+    const primaryScene = extractVisibleSceneText(message?.mes || '');
+    if (isUsableScenePrompt(primaryScene, minCharacters)) {
+        return primaryScene.slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+    }
+
+    const previousUserScene = getPreviousUserSceneText(messageId);
+    if (isUsableScenePrompt(previousUserScene, minCharacters)) {
+        return previousUserScene.slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+    }
+
+    return '';
+}
+
+function getPreviousUserSceneText(messageId) {
+    const context = getContext();
+    const numericMessageId = Number(messageId);
+    if (!Number.isInteger(numericMessageId) || !Array.isArray(context.chat)) {
         return '';
     }
 
-    const context = getContext();
-    const userName = context.name1 || '<user>';
-    const characterName = context.name2 || 'the main character';
-    return [
-        'Image prompt for the visible scene only.',
-        text.slice(0, 650),
-        `Include ${characterName} or another visible scene partner when ${userName} appears; avoid a solo ${userName} portrait.`,
-        'Focus on visible subjects, action, setting, mood, clothing, lighting, and camera framing.',
-        'No dialogue bubbles, captions, UI text, option lists, lore notes, or analysis.',
-    ].join(' ');
+    const lowerBound = Math.max(0, numericMessageId - 6);
+    for (let index = numericMessageId - 1; index >= lowerBound; index--) {
+        const candidate = context.chat[index];
+        if (!candidate || candidate.is_system || !candidate.is_user) {
+            continue;
+        }
+
+        const scene = extractVisibleSceneText(candidate.mes || '');
+        if (scene) {
+            return scene;
+        }
+    }
+
+    return '';
+}
+
+function getFallbackSceneMinCharacters() {
+    const configured = Number(settings().autoIllustration?.minCharacters);
+    if (!Number.isFinite(configured) || configured <= 0) {
+        return 0;
+    }
+
+    return Math.min(Math.floor(configured), 24);
+}
+
+function isUsableScenePrompt(text, minCharacters = 0) {
+    const scene = String(text || '').trim();
+    return scene.length >= minCharacters && scoreVisibleSentence(scene) > 0 && !looksLikeInstructionDump(scene);
 }
 
 function removeNonVisualBlocks(text) {
@@ -1219,6 +1277,199 @@ function removeNonVisualBlocks(text) {
     output = output.replace(/<branches\b[\s\S]*$/i, ' ');
     output = output.replace(/<details\b[\s\S]*$/i, ' ');
     return output;
+}
+
+function extractVisibleSceneText(value) {
+    const text = stripPromptNoise(value);
+    if (!text) {
+        return '';
+    }
+
+    const sentences = splitSceneSentences(text);
+    const selected = [];
+    let totalLength = 0;
+
+    for (const sentence of sentences) {
+        const cleaned = sanitizeSceneSentence(sentence);
+        if (!cleaned || isPromptNoiseSentence(cleaned) || scoreVisibleSentence(cleaned) <= 0) {
+            continue;
+        }
+
+        selected.push(cleaned);
+        totalLength += cleaned.length;
+        if (totalLength >= MAX_AUTO_SCENE_PROMPT_CHARS) {
+            break;
+        }
+    }
+
+    return compactSceneText(selected.join(' ')).slice(0, MAX_AUTO_SCENE_PROMPT_CHARS).trim();
+}
+
+function stripPromptNoise(value) {
+    let output = String(value || '');
+    output = removeAutoImagePlaceholders(removeInlineImagePrompt(removeNonVisualBlocks(output)));
+    output = output
+        .replace(toGlobalRegex(AUTO_FAILURE_RE), ' ')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/!\[[^\]]*]\([^)]+\)/g, ' ')
+        .replace(/\[([^\]]+)]\([^)]+\)/g, '$1')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/__([^_]+)__/g, '$1')
+        .replace(/[“”]/g, '"')
+        .replace(/\r/g, '\n');
+
+    return output
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line && !isPromptNoiseLine(line))
+        .join('\n');
+}
+
+function splitSceneSentences(text) {
+    return String(text || '')
+        .replace(/([。！？!?；;])\s*/g, '$1\n')
+        .split(/\n+/)
+        .map(sentence => sentence.trim())
+        .filter(Boolean);
+}
+
+function sanitizeSceneSentence(sentence) {
+    return compactSceneText(String(sentence || '')
+        .replace(/^\s*[-*•\d.、)）]+\s*/, '')
+        .replace(/^["'“”]+|["'“”]+$/g, '')
+        .replace(/^[^：:]{1,24}[：:]\s*/, match => {
+            return hasPromptNoiseKeywords(match) ? '' : match;
+        }));
+}
+
+function compactSceneText(value) {
+    return String(value || '')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\s+/g, ' ')
+        .replace(/\s+([。！？!?，,；;:.])/g, '$1')
+        .trim();
+}
+
+function isPromptNoiseLine(line) {
+    const text = String(line || '').trim();
+    if (!text) {
+        return true;
+    }
+
+    if (hasStrongPromptNoiseKeywords(text)) {
+        return true;
+    }
+
+    if (/^[-*•]\s*\*\*[^*]{1,40}\*\*\s*[：:]/.test(text)) {
+        return true;
+    }
+
+    if (/^(好的|收到|明白|明确|接到指令|接下来|下面|以下|根据|用户|系统|指令|要求|规则|注意|总结|分析)\b/.test(text)) {
+        return true;
+    }
+
+    if (/^【[^】]{1,40}】/.test(text) && hasPromptNoiseKeywords(text)) {
+        return true;
+    }
+
+    if (/^#{1,6}\s+/.test(text) && hasPromptNoiseKeywords(text)) {
+        return true;
+    }
+
+    return hasPromptNoiseKeywords(text) && scoreVisibleSentence(text) <= 1;
+}
+
+function isPromptNoiseSentence(sentence) {
+    const text = String(sentence || '').trim();
+    if (!text) {
+        return true;
+    }
+
+    if (hasStrongPromptNoiseKeywords(text)) {
+        return true;
+    }
+
+    if (hasPromptNoiseKeywords(text) && scoreVisibleSentence(text) <= 2) {
+        return true;
+    }
+
+    if (/^(不能|不要|必须|需要|应该|请|规则|要求|注意|总结|分析|视角|文风|剧情|设定)[：:，,]/.test(text)) {
+        return true;
+    }
+
+    return false;
+}
+
+function looksLikeInstructionDump(value) {
+    const text = String(value || '');
+    if (!text) {
+        return false;
+    }
+
+    const keywordHits = countPromptNoiseKeywords(text);
+    return keywordHits >= 2 || /【[^】]{1,40}】/.test(text) || /Rules for the marker|visible scene only|image-generation prompt/i.test(text);
+}
+
+function hasPromptNoiseKeywords(value) {
+    return countPromptNoiseKeywords(value) > 0;
+}
+
+function hasStrongPromptNoiseKeywords(value) {
+    const text = String(value || '').toLowerCase();
+    const strongKeywords = [
+        '接到指令', '用户的', '用户输入', '用户请求', '基于用户', '系统提示', '开发者指令',
+        '角色总结', '核心文风', '情感基调', '主观感受', '非传统写作', '写作要求',
+        '视角限制', '全知第三人称', '读者知道', '提示词标记', '隐藏要求', '后续剧情',
+        '进行扩写', '剧情发展', '不能写', '不要写', '必须', '需要基于',
+        'rules for the marker', 'prompt marker', 'chain-of-thought', 'writing plan',
+    ];
+
+    return strongKeywords.some(keyword => text.includes(keyword.toLowerCase()));
+}
+
+function countPromptNoiseKeywords(value) {
+    const text = String(value || '').toLowerCase();
+    const keywords = [
+        '角色总结', '核心文风', '情感基调', '主观感受', '非传统写作', '写作', '视角', '读者',
+        '用户', '系统', '指令', '要求', '规则', '标记', '提示词', '生图', '分析', '总结',
+        '剧情发展', '剧情', '设定', '身份', '人设', '输出', '选项', '解释', '背德', 'ntr',
+        '精神肉体', '洗脑', '全知第三人称', '限制', '不能写', '不要写', '必须', '需要',
+        'image prompt', 'prompt marker', 'visible scene only', 'rules for the marker', 'analysis',
+        'chain-of-thought', 'plot summary', 'writing plan', 'lore', 'json', 'markdown', 'caption',
+        'dialogue bubble', 'option list',
+    ];
+
+    return keywords.reduce((count, keyword) => text.includes(keyword.toLowerCase()) ? count + 1 : count, 0);
+}
+
+function scoreVisibleSentence(value) {
+    const text = String(value || '').toLowerCase();
+    if (!text) {
+        return 0;
+    }
+
+    const visualTerms = [
+        '站', '坐', '走', '跑', '看', '望', '拿', '捡', '递', '伸手', '低头', '弯腰', '钻', '靠',
+        '躺', '跪', '抱', '拉', '推', '打开', '关上', '桌', '椅', '床', '窗', '门', '房间', '餐厅',
+        '餐桌', '筷子', '地板', '街', '雨', '雪', '灯', '光', '阴影', '镜头', '特写', '构图',
+        '衣', '外套', '衬衫', '裙', '鞋', '制服', '表情', '微笑', '眼神', '脸', '手', '头发',
+        '身影', '背景', '场景', '画面', '姿势', '动作', '猫', '狗', '车', '书', '杯',
+        'standing', 'sitting', 'walking', 'running', 'looking', 'holding', 'reaching', 'kneeling',
+        'leaning', 'lying', 'table', 'chair', 'room', 'window', 'door', 'floor', 'street', 'rain',
+        'snow', 'light', 'lighting', 'shadow', 'camera', 'close-up', 'composition', 'wearing',
+        'dress', 'shirt', 'coat', 'uniform', 'expression', 'smile', 'eyes', 'hair', 'hands',
+        'background', 'scene', 'pose', 'action', 'cat', 'dog', 'car',
+    ];
+
+    const hits = visualTerms.reduce((score, term) => text.includes(term) ? score + 1 : score, 0);
+    if (hits <= 0) {
+        return 0;
+    }
+
+    const subjectBonus = /[\u4e00-\u9fa5]{2,6}|[a-z][a-z-]{2,}/i.test(text) ? 1 : 0;
+    const lengthPenalty = text.length > 900 ? -2 : 0;
+    return hits + subjectBonus + lengthPenalty;
 }
 
 function toGlobalRegex(pattern) {
@@ -1296,10 +1547,14 @@ function cancelActiveGeneration() {
 
 function prepareImagePromptForMode(prompt, mode) {
     if (mode === 'nsfw') {
-        return String(prompt || '').trim();
+        return cleanImagePrompt(prompt);
     }
 
-    const scenePrompt = softenSfwPromptTerms(cleanImageSceneText(prompt)).slice(0, 1000);
+    const scenePrompt = softenSfwPromptTerms(cleanImageSceneText(prompt)).slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+    if (!scenePrompt) {
+        return '';
+    }
+
     const context = getContext();
     const userName = context.name1 || '<user>';
     const characterName = context.name2 || 'the main character';
@@ -1308,20 +1563,26 @@ function prepareImagePromptForMode(prompt, mode) {
         : `Avoid a solo portrait of ${userName}; show ${characterName} or another visible scene partner when the scene involves the user.`;
 
     return [
-        'SFW image-generation prompt.',
         scenePrompt,
-        'Keep it non-explicit, fully clothed, safe for general review, with no nudity, sexual content, fetish framing, or exposed intimate body parts.',
+        'safe-for-work, fully clothed, non-explicit, natural scene, no nudity, no sexual content, no fetish framing, no exposed intimate body parts',
         partnerRule,
-        'Focus only on visible subjects, action, setting, mood, clothing, lighting, and camera framing.',
-        'No dialogue, captions, UI, watermarks, text, lore notes, rule text, or analysis.',
-    ].filter(Boolean).join(' ');
+        'visible subjects, clear action, setting, mood, clothing, lighting, camera framing',
+        'no dialogue, no captions, no UI text, no watermark, no lore notes, no rule text, no analysis',
+    ].filter(Boolean).join(', ');
 }
 
 function cleanImageSceneText(value) {
-    return cleanMessageText(removeAutoImagePlaceholders(removeInlineImagePrompt(removeNonVisualBlocks(value || ''))))
+    const visibleScene = extractVisibleSceneText(value);
+    if (visibleScene) {
+        return visibleScene;
+    }
+
+    const fallbackText = cleanMessageText(removeAutoImagePlaceholders(removeInlineImagePrompt(removeNonVisualBlocks(value || ''))))
         .replace(/\b(SKIP|image prompt|prompt|caption)\s*:\s*/gi, ' ')
         .replace(/\s+/g, ' ')
-        .trim();
+        .trim()
+        .slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+    return looksLikeInstructionDump(fallbackText) ? '' : fallbackText;
 }
 
 function softenSfwPromptTerms(value) {
@@ -1329,7 +1590,9 @@ function softenSfwPromptTerms(value) {
         .replace(/\b(nude|naked|topless|bottomless|explicit|pornographic|porn|erotic|sexual|sex)\b/gi, 'non-explicit')
         .replace(/\b(lingerie|underwear|panties|bra)\b/gi, 'modest outfit')
         .replace(/\b(seductive|aroused|orgasm|genitals|breasts?|nipples?)\b/gi, 'dramatic')
-        .replace(/裸露|裸体|色情|情色|性爱|性交|性器|乳头|胸部特写|内衣|私密/gi, '安全得体')
+        .replace(/\b(ntr|cuckold|affair|cheating|fetish)\b/gi, 'subtle dramatic tension')
+        .replace(/未成年|高中生|高二|高一|高三|学生|萝莉|正太/gi, 'young adult')
+        .replace(/裸露|裸体|色情|情色|性爱|性交|性器|乳头|胸部特写|胸部|内衣|内裤|没穿内裤|私密|性感|勾引|背德|偷情|刺激|调情|丝袜/gi, '安全得体')
         .trim();
 }
 
@@ -1355,7 +1618,7 @@ function getMaxImageSide() {
 function decideMode(prompt, requestedMode) {
     const normalizedPrompt = normalizePrompt(prompt);
     const hasNsfwSignal = scoreTerms(normalizedPrompt, settings().classifier.nsfwKeywords) > 0;
-    const hasMinorSignal = scoreTerms(normalizedPrompt, ['minor', 'child', 'kid', 'underage', 'teen', 'loli', 'shota', '未成年', '儿童', '小孩', '幼', '萝莉', '正太']) > 0;
+    const hasMinorSignal = scoreTerms(normalizedPrompt, ['minor', 'child', 'kid', 'underage', 'teen', 'loli', 'shota', 'student', 'high school', 'schoolgirl', 'schoolboy', '未成年', '儿童', '小孩', '幼', '萝莉', '正太', '学生', '高中生', '高一', '高二', '高三']) > 0;
     const hasNonConsentSignal = scoreTerms(normalizedPrompt, ['non-consensual', 'rape', 'forced', '强迫', '无同意', '非自愿']) > 0;
 
     if (hasNsfwSignal && hasMinorSignal) {
@@ -1420,6 +1683,7 @@ function cleanImagePrompt(text) {
     prompt = prompt.replace(/^```(?:\w+)?/i, '').replace(/```$/i, '').trim();
     prompt = prompt.replace(/^["'“”]+|["'“”]+$/g, '').trim();
     prompt = prompt.replace(/^(image prompt|prompt|caption)\s*:\s*/i, '').trim();
+    prompt = removeAutoImagePlaceholders(removeInlineImagePrompt(prompt)).trim();
 
     if (!prompt || isSkipImagePrompt(prompt)) {
         return '';
@@ -1429,7 +1693,29 @@ function cleanImagePrompt(text) {
         return '';
     }
 
+    if (looksLikeInstructionDump(prompt)) {
+        const visibleScene = extractVisibleSceneText(prompt);
+        if (visibleScene) {
+            return visibleScene.slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+        }
+
+        return '';
+    }
+
     return prompt.slice(0, 1200);
+}
+
+function normalizeImagePromptInput(prompt) {
+    const cleaned = cleanImagePrompt(prompt);
+    if (!cleaned) {
+        return '';
+    }
+
+    if (!looksLikeInstructionDump(cleaned)) {
+        return cleaned;
+    }
+
+    return extractVisibleSceneText(cleaned) || '';
 }
 
 function isSkipImagePrompt(text) {
