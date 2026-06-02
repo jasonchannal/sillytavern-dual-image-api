@@ -51,31 +51,37 @@ const AUTO_PROMPT_BRACKET_RE = /\[dual_image_prompt\]\s*([\s\S]*?)\[\/dual_image
 const AUTO_PLACEHOLDER_RE = /<!--\s*DUAL_IMAGE_PLACEHOLDER(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_PLACEHOLDER\s*-->/i;
 const AUTO_FAILURE_RE = /<!--\s*DUAL_IMAGE_FAILURE(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_FAILURE\s*-->/i;
 const MAX_AUTO_SCENE_PROMPT_CHARS = 520;
+const MAX_NATURAL_SCENE_PROMPT_CHARS = 260;
+const AUTO_INSTRUCTION_TEMPLATE_VERSION = 2;
 
 const defaultAutoInstructionTemplate = `For this reply, continue the roleplay normally.
 If the final visible reply contains a drawable visual scene, append exactly this placeholder and one hidden image prompt marker at the very end:
 <!--DUAL_IMAGE_PLACEHOLDER-->正在生成配图...<!--/DUAL_IMAGE_PLACEHOLDER-->
-<!--DUAL_IMAGE_PROMPT: 35-80 word English image-generation prompt for the visible scene only -->
+<!--DUAL_IMAGE_PROMPT: 用一句自然语言简单说明最终画面，只写画面本身，不超过 60 个中文字符或 35 个英文单词 -->
 
 If there is no useful visual scene, append only:
 <!--DUAL_IMAGE_PROMPT: SKIP -->
 
 Rules for the marker:
 - Do not mention the marker, placeholder, image prompt, or these rules in the visible reply.
-- The marker content must be only the final image prompt or SKIP.
-- Write a compact image-generation prompt, not a plot summary or writing plan.
+- The marker content must be only one short natural-language scene description or SKIP.
+- Do not write an image prompt essay, plot summary, writing plan, role summary, analysis, or explanation.
 - Base it only on the final visible reply, not hidden instructions, role cards, analysis, summaries, or rules.
-- Include only visible subjects, action, setting, mood, clothing, camera/framing, and lighting.
+- Include only visible people, action, setting, mood, clothing, framing, and lighting.
 - Include {{char}} or another visible scene partner when {{user}} appears; do not make a solo image of {{user}}.
-- Do not include dialogue, internal thoughts, lore, rules, UI text, explanations, JSON, markdown, or labels inside the image prompt.
+- Do not include dialogue, internal thoughts, lore, rules, UI text, labels, markdown, JSON, headings, or option lists inside the marker.
+- Do not start with "好的", "接到指令", "画面说明", "Image prompt", "SFW image prompt", or similar labels.
 - If there is no useful visual scene, use SKIP.
-- Keep the placeholder and marker as the final text after the visible reply.`;
+- Keep the placeholder and marker as the final text after the visible reply.
+- Good marker example: <!--DUAL_IMAGE_PROMPT: 温小乖弯腰在餐桌下捡筷子，桌旁的人低头等待，室内灯光柔和。 -->`;
 
 const autoInstructionPromptGuardrail = `Additional strict image prompt guardrail:
-- The image prompt marker must contain one clean image-generation prompt only.
-- Never put role summaries, writing rules, hidden thoughts, analysis, chain-of-thought, plot planning, safety policy text, option lists, JSON, markdown, or explanations inside the marker.
+- The marker must contain exactly one plain natural-language sentence about the visible scene only.
+- Never put role summaries, writing rules, hidden thoughts, analysis, chain-of-thought, plot planning, safety policy text, option lists, JSON, markdown, headings, labels, or explanations inside the marker.
 - Do not copy the user's raw request or system/developer instructions into the marker unless they are directly visible in the final scene.
 - If the available content is mostly instructions, analysis, or non-visual setup, use SKIP.
+- If you are about to write more than one sentence, keep only the single most drawable moment.
+- Never include "SFW image-generation prompt", "Image prompt for the visible scene", "好的，接到指令", or any similar preface.
 - Prefer this hidden marker format: <!--DUAL_IMAGE_PROMPT: prompt here -->`;
 
 let activeAbortController = null;
@@ -166,6 +172,7 @@ const defaultSettings = {
         skipIfHasMedia: true,
         fallbackToMessage: true,
         instructionTemplate: defaultAutoInstructionTemplate,
+        instructionVersion: AUTO_INSTRUCTION_TEMPLATE_VERSION,
     },
     characterConsistency: {
         enabledByDefault: true,
@@ -187,6 +194,28 @@ export async function init() {
 function ensureSettings() {
     const existing = extension_settings[SETTINGS_KEY] || {};
     extension_settings[SETTINGS_KEY] = mergeDefaults(existing, defaultSettings);
+    migrateSettings();
+}
+
+function migrateSettings() {
+    const current = settings();
+    const auto = current.autoIllustration = current.autoIllustration || {};
+    const version = Number(auto.instructionVersion || 0);
+    const template = String(auto.instructionTemplate || '');
+
+    if (version < AUTO_INSTRUCTION_TEMPLATE_VERSION && shouldUpgradeAutoInstructionTemplate(template)) {
+        auto.instructionTemplate = defaultAutoInstructionTemplate;
+        auto.instructionVersion = AUTO_INSTRUCTION_TEMPLATE_VERSION;
+        saveSettingsDebounced();
+    }
+}
+
+function shouldUpgradeAutoInstructionTemplate(template) {
+    const text = String(template || '');
+    return !text.trim()
+        || text.includes('35-80 word English image-generation prompt')
+        || text.includes('Write a compact image-generation prompt')
+        || text.includes('image-generation prompt for the visible scene only');
 }
 
 function mergeDefaults(value, defaults) {
@@ -348,11 +377,13 @@ function bindAutoSettings(current) {
 
     $('#dual_image_auto_instruction_template').val(auto.instructionTemplate).on('input', () => {
         auto.instructionTemplate = String($('#dual_image_auto_instruction_template').val() || defaultAutoInstructionTemplate);
+        auto.instructionVersion = AUTO_INSTRUCTION_TEMPLATE_VERSION;
         saveSettingsDebounced();
     });
 
     $('#dual_image_auto_reset_prompt').on('click', () => {
         auto.instructionTemplate = defaultAutoInstructionTemplate;
+        auto.instructionVersion = AUTO_INSTRUCTION_TEMPLATE_VERSION;
         $('#dual_image_auto_instruction_template').val(auto.instructionTemplate);
         saveSettingsDebounced();
         toastr.success('自动配图注入要求已恢复默认。', 'Dual Image API');
@@ -582,6 +613,83 @@ function findLatestGeneratedImagePath() {
     return '';
 }
 
+function rememberGeneratedImageAsCharacterReference(imagePath, scenePrompt, payload = {}) {
+    const path = String(imagePath || '').trim();
+    if (!path || !looksLikeHumanScene(scenePrompt)) {
+        return payload;
+    }
+
+    const state = getCharacterConsistencyState();
+    if (!state.enabled) {
+        return payload;
+    }
+
+    const names = new Set();
+    for (const character of payload.characters || []) {
+        if (character?.name) {
+            names.add(character.name);
+        }
+    }
+
+    if (!names.size) {
+        const defaultName = getDefaultCharacterName();
+        if (defaultName) {
+            names.add(defaultName);
+        }
+    }
+
+    let changed = false;
+    for (const name of names) {
+        const profile = ensureCharacterProfile(state, name);
+        if (!profile || profile.enabled === false || profile.referenceImage) {
+            continue;
+        }
+
+        profile.referenceImage = path;
+        profile.referenceWeight = clamp(Number(profile.referenceWeight) || state.referenceWeight || defaultSettings.characterConsistency.referenceWeight, 0, 2);
+        profile.updatedAt = new Date().toISOString();
+        changed = true;
+    }
+
+    if (!changed) {
+        return payload;
+    }
+
+    saveCharacterConsistencyState(state);
+    setTimeout(renderCharacterConsistencySettings, 50);
+
+    const updatedCharacters = (payload.characters || []).map(character => {
+        if (!character?.name || !names.has(character.name) || character.referenceImage) {
+            return character;
+        }
+
+        return {
+            ...character,
+            referenceImage: path,
+        };
+    });
+
+    const hasReferenceForPath = (payload.referenceImages || []).some(image => image?.url === path);
+    const newReferenceImages = state.useReferenceImages && !hasReferenceForPath
+        ? [
+            ...(payload.referenceImages || []),
+            ...[...names].map(name => {
+                const profile = state.characters?.[name];
+                return {
+                    name: getPromptSafeCharacterName(profile || { name }),
+                    url: path,
+                    weight: clamp(Number(profile?.referenceWeight) || state.referenceWeight || defaultSettings.characterConsistency.referenceWeight, 0, 2),
+                };
+            }),
+        ]
+        : (payload.referenceImages || []);
+
+    return {
+        characters: updatedCharacters,
+        referenceImages: newReferenceImages,
+    };
+}
+
 function loadProfileInputs(mode) {
     const profile = settings().profiles[mode];
     $(`[data-profile="${mode}"][data-field]`).each(function () {
@@ -775,7 +883,8 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
                 }
 
                 const imagePath = result.path || await saveGeneratedImage(result.data, result.format || 'png', normalizedPrompt, imageTarget);
-                return { prompt: imagePrompt, imagePath, mode: decision.mode, attempts: attempt, characterConsistency };
+                const updatedCharacterConsistency = rememberGeneratedImageAsCharacterReference(imagePath, normalizedPrompt, characterConsistency);
+                return { prompt: imagePrompt, imagePath, mode: decision.mode, attempts: attempt, characterConsistency: updatedCharacterConsistency };
             } catch (error) {
                 if (abortController.signal.aborted || attempt >= maxAttempts) {
                     throw error;
@@ -1446,12 +1555,12 @@ function buildFallbackPromptFromMessage(message, messageId = null) {
     const minCharacters = getFallbackSceneMinCharacters();
     const primaryScene = extractVisibleSceneText(message?.mes || '');
     if (isUsableScenePrompt(primaryScene, minCharacters)) {
-        return primaryScene.slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+        return simplifyNaturalScenePrompt(primaryScene);
     }
 
     const previousUserScene = getPreviousUserSceneText(messageId);
     if (isUsableScenePrompt(previousUserScene, minCharacters)) {
-        return previousUserScene.slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+        return simplifyNaturalScenePrompt(previousUserScene);
     }
 
     return '';
@@ -1520,6 +1629,11 @@ function removeNonVisualBlocks(text) {
 }
 
 function extractVisibleSceneText(value) {
+    const quotedScene = extractQuotedSceneText(value);
+    if (quotedScene) {
+        return quotedScene;
+    }
+
     const text = stripPromptNoise(value);
     if (!text) {
         return '';
@@ -1543,6 +1657,29 @@ function extractVisibleSceneText(value) {
     }
 
     return compactSceneText(selected.join(' ')).slice(0, MAX_AUTO_SCENE_PROMPT_CHARS).trim();
+}
+
+function extractQuotedSceneText(value) {
+    const text = String(value || '');
+    if (!text) {
+        return '';
+    }
+
+    const patterns = [
+        /(?:用户(?:的)?(?:简短)?输入|用户请求|用户说|用户原文|基于用户|raw request|user request)[^“”"']{0,40}[“"']([^“”"']{8,220})[”"']/gi,
+        /(?:画面|场景|scene)[^“”"']{0,20}[“"']([^“”"']{8,220})[”"']/gi,
+    ];
+
+    for (const pattern of patterns) {
+        for (const match of text.matchAll(pattern)) {
+            const candidate = compactSceneText(stripImagePromptPreface(match[1] || ''));
+            if (candidate && scoreVisibleSentence(candidate) > 0 && !looksLikeInstructionDump(candidate)) {
+                return candidate.slice(0, MAX_NATURAL_SCENE_PROMPT_CHARS).trim();
+            }
+        }
+    }
+
+    return '';
 }
 
 function stripPromptNoise(value) {
@@ -1648,7 +1785,9 @@ function looksLikeInstructionDump(value) {
     }
 
     const keywordHits = countPromptNoiseKeywords(text);
-    return keywordHits >= 2 || /【[^】]{1,40}】/.test(text) || /Rules for the marker|visible scene only|image-generation prompt/i.test(text);
+    return keywordHits >= 2
+        || /【[^】]{1,40}】/.test(text)
+        || /Rules for the marker|visible scene only|image-generation prompt|SFW image|NSFW image|Image prompt for|接到指令|用户(?:的)?(?:简短)?输入|角色总结|核心文风/i.test(text);
 }
 
 function hasPromptNoiseKeywords(value) {
@@ -1786,11 +1925,12 @@ function cancelActiveGeneration() {
 }
 
 function prepareImagePromptForMode(prompt, mode) {
+    const simplePrompt = simplifyNaturalScenePrompt(cleanImagePrompt(prompt));
     if (mode === 'nsfw') {
-        return cleanImagePrompt(prompt);
+        return simplePrompt;
     }
 
-    const scenePrompt = softenSfwPromptTerms(cleanImageSceneText(prompt)).slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+    const scenePrompt = simplifyNaturalScenePrompt(softenSfwPromptTerms(cleanImageSceneText(simplePrompt) || simplePrompt));
     if (!scenePrompt) {
         return '';
     }
@@ -1799,16 +1939,15 @@ function prepareImagePromptForMode(prompt, mode) {
     const userName = context.name1 || '<user>';
     const characterName = context.name2 || 'the main character';
     const partnerRule = scenePrompt.includes(userName) || scenePrompt.includes('<user>')
-        ? `If ${userName} is visible, include ${characterName} or another visible scene partner in the same frame; do not make a solo ${userName} portrait.`
-        : `Avoid a solo portrait of ${userName}; show ${characterName} or another visible scene partner when the scene involves the user.`;
+        ? `如果 ${userName} 出现在画面里，同时画出 ${characterName} 或另一个同场人物，不要只画 ${userName} 单人。`
+        : `如果场景涉及 ${userName}，画面里需要有 ${characterName} 或另一个同场人物。`;
 
-    return [
+    return compactSceneText([
         scenePrompt,
-        'safe-for-work, fully clothed, non-explicit, natural scene, no nudity, no sexual content, no fetish framing, no exposed intimate body parts',
+        '画面安全、穿着完整、非情色，不出现裸露、私密部位或挑逗特写。',
         partnerRule,
-        'visible subjects, clear action, setting, mood, clothing, lighting, camera framing',
-        'no dialogue, no captions, no UI text, no watermark, no lore notes, no rule text, no analysis',
-    ].filter(Boolean).join(', ');
+        '不要文字、对话框、水印、界面元素或规则说明。',
+    ].filter(Boolean).join(' ')).slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
 }
 
 function buildCharacterConsistencyPayload(scenePrompt, mode) {
@@ -1853,25 +1992,25 @@ function applyCharacterConsistencyToPrompt(basePrompt, payload, mode) {
     const characterPrompts = payload.characters.map(character => {
         const appearance = [
             character.visualPrompt,
-            character.referenceImage ? 'match the provided reference image identity' : '',
+            character.referenceImage ? '参考人物图中的脸型、发型和气质' : '',
         ].filter(Boolean).join(', ');
 
         if (character.promptName) {
             return `${character.promptName}: ${appearance}`;
         }
 
-        return `character appearance: ${appearance}`;
+        return `参考人物: ${appearance}`;
     });
 
     const identityRule = mode === 'sfw'
-        ? 'keep the same face, hairstyle, eye color, body type, outfit identity, and recognizable details across images'
-        : 'keep the same character identity, face, hairstyle, body type, outfit identity, and recognizable details across images';
+        ? '保持同一人物的脸型、发型、眼睛、体型、服装识别点和整体气质一致，画面保持安全非情色。'
+        : '保持同一人物的身份、脸型、发型、体型、服装识别点和整体气质一致。';
 
-    return [
+    return compactSceneText([
         prompt,
-        `Character consistency: ${characterPrompts.join('; ')}`,
+        `人物一致性：${characterPrompts.join('；')}。`,
         identityRule,
-    ].filter(Boolean).join(', ');
+    ].filter(Boolean).join(' ')).slice(0, 900);
 }
 
 function getMatchedCharacterProfiles(scenePrompt, state = getCharacterConsistencyState()) {
@@ -2099,7 +2238,7 @@ function cleanImagePrompt(text) {
     let prompt = String(text || '').trim();
     prompt = prompt.replace(/^```(?:\w+)?/i, '').replace(/```$/i, '').trim();
     prompt = prompt.replace(/^["'“”]+|["'“”]+$/g, '').trim();
-    prompt = prompt.replace(/^(image prompt|prompt|caption)\s*:\s*/i, '').trim();
+    prompt = stripImagePromptPreface(prompt);
     prompt = removeAutoImagePlaceholders(removeInlineImagePrompt(prompt)).trim();
 
     if (!prompt || isSkipImagePrompt(prompt)) {
@@ -2113,13 +2252,13 @@ function cleanImagePrompt(text) {
     if (looksLikeInstructionDump(prompt)) {
         const visibleScene = extractVisibleSceneText(prompt);
         if (visibleScene) {
-            return visibleScene.slice(0, MAX_AUTO_SCENE_PROMPT_CHARS);
+            return simplifyNaturalScenePrompt(visibleScene);
         }
 
         return '';
     }
 
-    return prompt.slice(0, 1200);
+    return simplifyNaturalScenePrompt(prompt);
 }
 
 function normalizeImagePromptInput(prompt) {
@@ -2128,11 +2267,59 @@ function normalizeImagePromptInput(prompt) {
         return '';
     }
 
-    if (!looksLikeInstructionDump(cleaned)) {
-        return cleaned;
+    return simplifyNaturalScenePrompt(cleaned);
+}
+
+function stripImagePromptPreface(value) {
+    let output = String(value || '').trim();
+    for (let index = 0; index < 4; index++) {
+        const next = output
+            .replace(/^(?:SFW|NSFW)?\s*(?:image[-\s]?generation\s*)?(?:image\s*)?(?:prompt|caption|scene description|visible scene)\s*(?:for\s+the\s+visible\s+scene\s+only)?\s*[:：.\-。]*/i, '')
+            .replace(/^(?:画面说明|画面描述|生图提示词|图片提示词|提示词|场景说明|场景描述)\s*[:：.\-。]*/i, '')
+            .replace(/^(?:好的|收到|明白|接到指令)[，,。.\s]*/i, '')
+            .trim();
+        if (next === output) {
+            break;
+        }
+        output = next;
+    }
+    return output.trim();
+}
+
+function simplifyNaturalScenePrompt(value) {
+    let prompt = stripImagePromptPreface(value);
+    if (!prompt || isSkipImagePrompt(prompt)) {
+        return '';
     }
 
-    return extractVisibleSceneText(cleaned) || '';
+    const quotedScene = extractQuotedSceneText(prompt);
+    prompt = quotedScene || stripPromptNoise(prompt);
+
+    const sentences = splitSceneSentences(prompt)
+        .map(sentence => stripImagePromptPreface(sanitizeSceneSentence(sentence)))
+        .filter(sentence => sentence && !isPromptNoiseSentence(sentence) && scoreVisibleSentence(sentence) > 0);
+
+    const selected = [];
+    let totalLength = 0;
+    for (const sentence of sentences) {
+        selected.push(sentence);
+        totalLength += sentence.length;
+        if (selected.length >= 2 || totalLength >= MAX_NATURAL_SCENE_PROMPT_CHARS) {
+            break;
+        }
+    }
+
+    const result = compactSceneText((selected.length ? selected.join(' ') : prompt))
+        .replace(/\b(SKIP|image prompt|prompt|caption)\s*:\s*/gi, ' ')
+        .replace(/^(?:SFW|NSFW)\s+/i, '')
+        .trim();
+
+    if (!result || looksLikeInstructionDump(result)) {
+        const scene = extractVisibleSceneText(result);
+        return scene && scene !== result ? simplifyNaturalScenePrompt(scene) : '';
+    }
+
+    return result.slice(0, MAX_NATURAL_SCENE_PROMPT_CHARS).trim();
 }
 
 function isSkipImagePrompt(text) {
