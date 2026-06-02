@@ -50,6 +50,7 @@ const AUTO_PROMPT_TAG_RE = /<dual_image_prompt>\s*([\s\S]*?)<\/dual_image_prompt
 const AUTO_PROMPT_BRACKET_RE = /\[dual_image_prompt\]\s*([\s\S]*?)\[\/dual_image_prompt\]/i;
 const AUTO_PLACEHOLDER_RE = /<!--\s*DUAL_IMAGE_PLACEHOLDER(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_PLACEHOLDER\s*-->/i;
 const AUTO_FAILURE_RE = /<!--\s*DUAL_IMAGE_FAILURE(?::\s*([a-zA-Z0-9_-]+))?\s*-->\s*[\s\S]*?\s*<!--\s*\/DUAL_IMAGE_FAILURE\s*-->/i;
+const AUTO_RESULT_RE = /<!--\s*DUAL_IMAGE_RESULT(?::[^>]*)?-->/i;
 const MAX_AUTO_SCENE_PROMPT_CHARS = 520;
 const MAX_NATURAL_SCENE_PROMPT_CHARS = 260;
 const AUTO_INSTRUCTION_TEMPLATE_VERSION = 2;
@@ -1151,6 +1152,7 @@ function getMessageGeneratedImagePaths(message) {
     const paths = [
         ...getMetadataImagePaths(extra.dual_image_auto),
         ...getMetadataImagePaths(extra.dual_image_manual),
+        ...extractGeneratedImageMarkdownPaths(message?.mes),
     ];
 
     if (hasDualImageMetadata && Array.isArray(extra.media)) {
@@ -1158,6 +1160,29 @@ function getMessageGeneratedImagePaths(message) {
             if (item?.type === MEDIA_TYPE.IMAGE && item?.url && (item.dual_image_auto || item.dual_image_mode || item.source === MEDIA_SOURCE.GENERATED)) {
                 paths.push(item.url);
             }
+        }
+    }
+
+    return normalizeImagePathList(paths);
+}
+
+function extractGeneratedImageMarkdownPaths(text) {
+    const raw = String(text || '');
+    if (!raw) {
+        return [];
+    }
+
+    const paths = [];
+    const markdownImageRe = /!\[([^\]]*)]\(([^)\s]+)\)/g;
+    for (const match of raw.matchAll(markdownImageRe)) {
+        const alt = String(match[1] || '');
+        const url = String(match[2] || '').trim();
+        if (!url) {
+            continue;
+        }
+
+        if (alt.includes('AI 配图') || AUTO_RESULT_RE.test(raw) || /(?:^|\/)user\/images\//i.test(url)) {
+            paths.push(url);
         }
     }
 
@@ -1379,6 +1404,10 @@ function shouldAutoIllustrateMessage(message, source) {
     }
 
     if (message.extra?.dual_image_mode || message.extra?.dual_image_manual) {
+        return false;
+    }
+
+    if (getMessageGeneratedImagePaths(message).length > 0) {
         return false;
     }
 
@@ -1692,7 +1721,7 @@ function formatImageMarkdown(imagePath) {
 
 function formatImageMarkdownList(imagePaths) {
     return normalizeImagePathList(imagePaths)
-        .map((imagePath, index) => `${formatImageMarkdown(imagePath)}<!--DUAL_IMAGE_RESULT:${index + 1}:${hashString(imagePath)}-->`)
+        .map((imagePath, index) => `${formatImageMarkdown(imagePath)}\n<!--DUAL_IMAGE_RESULT:${index + 1}:${hashString(imagePath)}-->`)
         .join('\n\n');
 }
 
