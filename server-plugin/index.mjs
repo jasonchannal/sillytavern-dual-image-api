@@ -10,7 +10,7 @@ export const info = {
     description: 'Routes SillyTavern image generation requests to separate SFW and NSFW third-party APIs.',
 };
 
-const pluginVersion = '0.2.17';
+const pluginVersion = '0.2.18';
 const pluginDirectory = path.dirname(fileURLToPath(import.meta.url));
 const validModes = new Set(['sfw', 'nsfw']);
 const saveableImageFormats = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);

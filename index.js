@@ -828,14 +828,6 @@ async function createGeneratedImage(prompt, requestedMode = 'auto', options = {}
     }
 
     const decision = decideMode(normalizedPrompt, requestedMode);
-    if (decision.blocked) {
-        setStatus(`生成已拦截：${decision.reason}`);
-        if (showToasts) {
-            toastr.error(decision.reason, 'Dual Image API');
-        }
-        return null;
-    }
-
     if (decision.mode === 'nsfw' && !settings().allowNsfw) {
         const message = 'NSFW 模式未启用。请先在插件设置中打开允许 NSFW 模式。';
         setStatus(message);
@@ -2453,25 +2445,13 @@ function getMaxImageSide() {
 
 function decideMode(prompt, requestedMode) {
     const normalizedPrompt = normalizePrompt(prompt);
-    const hasNsfwSignal = scoreTerms(normalizedPrompt, settings().classifier.nsfwKeywords) > 0;
-    const hasMinorSignal = scoreTerms(normalizedPrompt, ['minor', 'child', 'kid', 'underage', 'teen', 'loli', 'shota', 'student', 'high school', 'schoolgirl', 'schoolboy', '未成年', '儿童', '小孩', '幼', '萝莉', '正太', '学生', '高中生', '高一', '高二', '高三']) > 0;
-    const hasNonConsentSignal = scoreTerms(normalizedPrompt, ['non-consensual', 'rape', 'forced', '强迫', '无同意', '非自愿']) > 0;
-
-    if (hasNsfwSignal && hasMinorSignal) {
-        return { blocked: true, reason: '提示词包含未成年人相关成人内容，已拦截。' };
-    }
-
-    if (hasNsfwSignal && hasNonConsentSignal) {
-        return { blocked: true, reason: '提示词包含非自愿或强迫相关成人内容，已拦截。' };
-    }
-
     const requested = ['sfw', 'nsfw', 'auto'].includes(String(requestedMode).toLowerCase())
         ? String(requestedMode).toLowerCase()
         : 'auto';
     const preference = requested === 'auto' ? settings().defaultMode : requested;
 
     if (preference === 'sfw' || preference === 'nsfw') {
-        return { blocked: false, mode: preference };
+        return { mode: preference };
     }
 
     const nsfwScore = scoreTerms(normalizedPrompt, settings().classifier.nsfwKeywords);
@@ -2480,7 +2460,6 @@ function decideMode(prompt, requestedMode) {
     const threshold = Number(settings().classifier.nsfwThreshold) || defaultSettings.classifier.nsfwThreshold;
 
     return {
-        blocked: false,
         mode: finalScore >= threshold ? 'nsfw' : 'sfw',
     };
 }
